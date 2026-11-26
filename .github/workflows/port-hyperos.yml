@@ -169,16 +169,7 @@ jobs:
           FOUND_BIN=$(find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -name 'update-binary' ! -path '*/.git/*' | head -n 1 || true)
           if [[ -z "$FOUND_BIN" ]]; then
             TMP_TPL="$GITHUB_WORKSPACE/work/tmp_update_binary"
-            cat <<'EOF' > "$TMP_TPL"
-#!/sbin/sh
-OUTFD="$2"
-ZIPFILE="$3"
-ui_print() {
-  echo -e "ui_print $1\nui_print" > "/proc/self/fd/$OUTFD"
-}
-ui_print "Flashing port ROM for SM-A045F..."
-exit 0
-EOF
+            python3 -c 'import sys; open(sys.argv[1], "w").write("#!/sbin/sh\nOUTFD=\"$2\"\nZIPFILE=\"$3\"\nui_print() { echo -e \"ui_print $1\\nui_print\" > \"/proc/self/fd/$OUTFD\"; }\nui_print \"Flashing port ROM for SM-A045F...\"\nexit 0\n")' "$TMP_TPL"
             chmod +x "$TMP_TPL"
             FOUND_BIN="$TMP_TPL"
           else
