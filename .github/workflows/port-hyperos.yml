@@ -106,7 +106,7 @@ jobs:
             [[ -f "$f" ]] && chmod +x "$f" || true
           done
 
-      - name: Download official SM-A045F firmware via samloader-rs
+      - name: Download official SM-A045F firmware via samloader
         env:
           SAM_MODEL: ${{ inputs.model }}
           SAM_CSC: ${{ inputs.csc }}
@@ -116,20 +116,22 @@ jobs:
           set -euo pipefail
           OUT_FW="$GITHUB_WORKSPACE/work/base_fw"
           mkdir -p "$OUT_FW"
+          cd "$OUT_FW"
 
-          if command -v samloader-rs >/dev/null 2>&1; then
-            samloader-rs --help || true
-            AUTH_ARGS=()
-            [[ -n "${SAM_IMEI:-}" ]] && AUTH_ARGS+=(--imei "$SAM_IMEI")
-            [[ -n "${SAM_SERIAL:-}" ]] && AUTH_ARGS+=(--serial "$SAM_SERIAL")
-            samloader-rs checkupdate -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" || true
-            samloader-rs download -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW" || \
-              samloader-rs pull -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW"
-          elif command -v samloader >/dev/null 2>&1; then
-            samloader --help || true
-            samloader checkupdate "$SAM_MODEL" "$SAM_CSC" || samloader checkupdate --model "$SAM_MODEL" --region "$SAM_CSC" || true
-            samloader download "$SAM_MODEL" "$SAM_CSC" -O "$OUT_FW" || \
-              samloader download --model "$SAM_MODEL" --region "$SAM_CSC" -O "$OUT_FW"
+          if command -v samloader >/dev/null 2>&1; then
+            samloader download --help || true
+            samloader check-update --model "$SAM_MODEL" --region "$SAM_CSC" || true
+            EXTRA_ARGS=()
+            if samloader download --help 2>&1 | grep -q -- '--imei'; then
+              [[ -n "${SAM_IMEI:-}" ]] && EXTRA_ARGS+=(--imei "$SAM_IMEI")
+            fi
+            if samloader download --help 2>&1 | grep -q -- '--serial'; then
+              [[ -n "${SAM_SERIAL:-}" ]] && EXTRA_ARGS+=(--serial "$SAM_SERIAL")
+            fi
+            samloader download --model "$SAM_MODEL" --region "$SAM_CSC" "${EXTRA_ARGS[@]}"
+          elif command -v samloader-rs >/dev/null 2>&1; then
+            samloader-rs check-update --model "$SAM_MODEL" --region "$SAM_CSC" || true
+            samloader-rs download --model "$SAM_MODEL" --region "$SAM_CSC"
           else
             echo "Error: samloader binary not found" >&2
             exit 1
