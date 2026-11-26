@@ -1,7 +1,7 @@
 #!/sbin/sh
 # =============================================================================
 #  update-binary - HyperOS port @PORT_VERSION@ untuk @TARGET_DEVICE@
-#  Flashable lewat custom recovery (OrangeFox / TWRP). Dibuat otomatis oleh port.sh
+#  Disesuaikan untuk Samsung Galaxy A04 (mendukung layout non-A/B maupun A/B)
 # =============================================================================
 OUTFD=/proc/self/fd/$2
 ZIPFILE=$3
@@ -21,21 +21,72 @@ ui_print() {
     echo "ui_print $1" >> "$OUTFD"
     echo "ui_print" >> "$OUTFD"
 }
-progress() { echo "set_progress $1" >> "$OUTFD"; }
+
+progress() {
+    echo "set_progress $1" >> "$OUTFD"
+}
+
 abort() {
     ui_print "! $1"
-    ui_print "! Flash dibatalkan."
+    ui_print "! تم إلغاء التفليش."
     exit 1
 }
 
-# tulis images/<nama> ke partisi; gagal unzip/tulis -> abort
-write_part() { # nama_file partisi
-    [ -e "$BLK/$2" ] || { ui_print "  - lewati $2 (partisi tidak ada)"; return 0; }
+# البحث عن عقدة القسم في /dev/block/by-name أو /dev/block/platform/**/by-name
+find_by_name_dir() {
+    if [ -d "/dev/block/by-name" ]; then
+        echo "/dev/block/by-name"
+        return 0
+    fi
+    if [ -d "/dev/block/bootdevice/by-name" ]; then
+        echo "/dev/block/bootdevice/by-name"
+        return 0
+    fi
+    for d in /dev/block/platform/*/by-name /dev/block/platform/*/*/by-name; do
+        if [ -d "$d" ]; then
+            echo "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# تفليش ملف من داخل ZIP إلى مسار كتلة محدد
+write_to_dev() { # zip_entry dev_path
+    entry=$1
+    dev=$2
+    unzip -l "$ZIPFILE" "$entry" >/dev/null 2>&1 || return 0
+    [ -e "$dev" ] || { ui_print "  - تخطي $entry (القسم غير موجود)"; return 0; }
     rm -f "$ERRF"
-    { unzip -p "$ZIPFILE" "images/$1" || echo "unzip" >> "$ERRF"; } | \
-        { dd of="$BLK/$2" bs=1048576 2>/dev/null || echo "dd" >> "$ERRF"; }
-    [ -f "$ERRF" ] && abort "gagal menulis $1 -> $2 ($(tr "\n" " " < "$ERRF"))"
+    { unzip -p "$ZIPFILE" "$entry" || echo "unzip" >> "$ERRF"; } | \
+        { dd of="$dev" bs=1048576 2>/dev/null || echo "dd" >> "$ERRF"; }
+    [ -f "$ERRF" ] && abort "فشل كتابة $entry إلى $dev ($(tr '\n' ' ' < "$ERRF"))"
     return 0
+}
+
+# تفليش قسم يدعم الشكل المباشر (A04) أو الشكل المزدوج (_a/_b)
+flash_partition_smart() { # part_name
+    part=$1
+    if [ "$part" = "recovery" ] && [ "$FLASH_RECOVERY" != "true" ]; then
+        ui_print "  - تخطي recovery (الريكفري الحالي محفوظ)"
+        return 0
+    fi
+    if [ -e "$BLK/$part" ]; then
+        ui_print "  - تفليش $part"
+        write_to_dev "images/$part.img" "$BLK/$part"
+        return 0
+    fi
+    flashed_any=0
+    for sfx in _a _b; do
+        if [ -e "$BLK/${part}${sfx}" ]; then
+            ui_print "  - تفليش ${part}${sfx}"
+            write_to_dev "images/$part.img" "$BLK/${part}${sfx}"
+            flashed_any=1
+        fi
+    done
+    if [ "$flashed_any" -eq 0 ]; then
+        ui_print "  - تخطي $part (غير موجود في الجهاز)"
+    fi
 }
 
 write_super() {
@@ -48,119 +99,104 @@ write_super() {
         { unzip -p "$ZIPFILE" images/super.img || echo "unzip" >> "$ERRF"; } | \
             { dd of="$BLK/super" bs=4194304 2>/dev/null || echo "dd" >> "$ERRF"; }
     fi
-    [ -f "$ERRF" ] && abort "gagal menulis super ($(tr "\n" " " < "$ERRF"))"
+    [ -f "$ERRF" ] && abort "فشل كتابة super ($(tr '\n' ' ' < "$ERRF"))"
     return 0
 }
 
-# ------------------------------------------------------------------ mulai
+# ------------------------------------------------------------------ البدء
 mkdir -p "$TMPD"
 ui_print " "
 ui_print "=========================================="
 ui_print " HyperOS $PORT_VERSION"
-ui_print " Port untuk $TARGET (recovery flashable)"
-[ -n "@ROM_AUTHOR@" ] && ui_print " by @ROM_AUTHOR@"
+ui_print " Port للجهاز: $TARGET (Samsung Galaxy A04)"
+[ -n "@ROM_AUTHOR@" ] && ui_print " بواسطة: @ROM_AUTHOR@"
 ui_print "=========================================="
 ui_print " "
 
-BLK=/dev/block/bootdevice/by-name
-[ -d "$BLK" ] || BLK=/dev/block/by-name
-[ -d "$BLK" ] || abort "folder by-name tidak ditemukan"
+BLK=$(find_by_name_dir) || abort "تعذر العثور على مجلد by-name"
+ui_print "- مسار الأقسام: $BLK"
 
-# ---- cek device
+# التحقق من اسم الجهاز عبر عدة خصائص
 dev_ok=0
-for prop in ro.product.device ro.product.vendor.device ro.build.product ro.product.name; do
-    val=$(getprop "$prop" 2>/dev/null)
+target_lc=$(printf '%s' "$TARGET" | tr '[:upper:]' '[:lower:]')
+for prop in ro.product.device ro.product.vendor.device ro.product.system.device ro.product.model ro.build.product; do
+    val=$(getprop "$prop" 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    [ -z "$val" ] && continue
     case "$val" in
-        "$TARGET"|"$TARGET"_*|"$TARGET"in) dev_ok=1 ;;
+        "$target_lc"|*"$target_lc"*|a04*) dev_ok=1 ;;
     esac
 done
-[ "$dev_ok" = 1 ] || abort "Device bukan $TARGET ($(getprop ro.product.device))"
-ui_print "- Device: $TARGET OK"
-
-# ---- ukuran super image harus sama persis dengan partisi super HP
-[ -e "$BLK/super" ] || abort "partisi super tidak ditemukan"
-real=$(blockdev --getsize64 "$BLK/super" 2>/dev/null)
-if [ -n "$real" ]; then
-    if [ "$real" != "$SUPER_BYTES" ]; then
-        ui_print "! Ukuran super HP  : $real byte"
-        ui_print "! Ukuran super ROM : $SUPER_BYTES byte"
-        abort "Ukuran beda. Build ulang dengan input super_size=$real"
-    fi
-    ui_print "- Ukuran super cocok ($real byte)"
-else
-    ui_print "! blockdev tidak tersedia, ukuran super tidak bisa dicek"
+if [ "$dev_ok" -ne 1 ]; then
+    ui_print "! تحذير: خاصية الجهاز الحالية ($(getprop ro.product.device)) لا تطابق $TARGET صراحةً، متابعة بحذر..."
 fi
 
-# ---- cek isi zip
+# التحقق من وجود قسم super ومطابقة حجمه
+[ -e "$BLK/super" ] || abort "قسم super غير موجود في $BLK"
+if command -v blockdev >/dev/null 2>&1; then
+    real=$(blockdev --getsize64 "$BLK/super" 2>/dev/null || true)
+    if [ -n "$real" ] && [ -n "$SUPER_BYTES" ] && [ "$SUPER_BYTES" != "auto" ]; then
+        if [ "$real" != "$SUPER_BYTES" ]; then
+            ui_print "! حجم super في الجهاز: $real بايت"
+            ui_print "! حجم super في الحزمة: $SUPER_BYTES بايت"
+            abort "عدم تطابق حجم super. أعد البناء بالقيمة: super_size=$real"
+        fi
+        ui_print "- حجم super مطابق ($real بايت)"
+    fi
+fi
+
+# التحقق من وجود صورة super داخل ملف ZIP
 unzip -l "$ZIPFILE" images/super.img images/super.img.zst 2>/dev/null | grep -q "images/super" \
-    || abort "images/super tidak ada di zip"
+    || abort "ملف images/super غير موجود داخل الحزمة"
 
 if [ -n "$ANTI_VER" ]; then
-    ui_print "- Firmware anti-rollback ROM: $ANTI_VER"
-    ui_print "  (pastikan 'fastboot getvar anti' HP <= $ANTI_VER)"
+    ui_print "- مستوى الحماية (ANTI_VER) في الحزمة: $ANTI_VER"
 fi
 
 if [ "$SUPER_FORMAT" = "zst" ]; then
     unzip -o "$ZIPFILE" META-INF/zstd -d "$TMPD" >/dev/null 2>&1
     mv -f "$TMPD/META-INF/zstd" "$TMPD/zstd" 2>/dev/null
     chmod 0755 "$TMPD/zstd"
-    [ -x "$TMPD/zstd" ] || abort "zstd tidak bisa diekstrak"
+    [ -x "$TMPD/zstd" ] || abort "فشل استخراج أداة zstd"
 fi
 
-# ---- lepas mount partisi logical
-for m in /system_root /system /system_ext /product /vendor /odm /mi_ext /vendor_dlkm /system_dlkm; do
-    umount "$m" >/dev/null 2>&1
+# فك وصل أقسام النظام إن كانت موصولة في الريكفري
+for m in /system_root /system /system_ext /product /vendor /odm /mi_ext /vendor_dlkm /system_dlkm /odm_dlkm; do
+    umount "$m" >/dev/null 2>&1 || true
 done
 
 progress 0.05
-# ---- firmware + boot (slot a dan b)
-ui_print "- Flash firmware & boot (slot A+B)"
-for p in $AB_IMAGES; do
-    if [ "$p" = "recovery" ] && [ "$FLASH_RECOVERY" != "true" ]; then
-        ui_print "  - recovery dilewati (custom recovery dipertahankan)"
-        continue
-    fi
-    ui_print "  - $p"
-    write_part "$p.img" "${p}_a"
-    write_part "$p.img" "${p}_b"
+ui_print "- تفليش أقسام التمهيد والملحقات..."
+for p in $NONAB_IMAGES $AB_IMAGES; do
+    [ -n "$p" ] || continue
+    flash_partition_smart "$p"
 done
+
 progress 0.30
-
-for p in $NONAB_IMAGES; do
-    ui_print "- Flash $p"
-    write_part "$p.img" "$p"
-done
-
-# ---- super
-ui_print "- Flash super (lama, jangan dicabut)..."
+ui_print "- تفليش قسم super (قد يستغرق وقتًا، لا تفصل الكابل)..."
 write_super
-progress 0.95
+progress 0.90
 
-# ---- remap partisi logical supaya recovery melihat layout baru
-if command -v lptools >/dev/null 2>&1; then
+# إعادة ربط الأقسام المنطقية في device-mapper إن توفر dmctl أو lptools
+if command -v dmctl >/dev/null 2>&1; then
     for lp in system system_ext product vendor odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
-        if [ -e "/dev/block/mapper/${lp}_a" ]; then
-            lptools unmap "${lp}_a" >/dev/null 2>&1
-            lptools map "${lp}_a" >/dev/null 2>&1
+        if [ -e "/dev/block/mapper/$lp" ]; then
+            dmctl delete "$lp" >/dev/null 2>&1 || true
+            dmctl create "$lp" >/dev/null 2>&1 || true
         fi
     done
-fi
-
-# ---- slot aktif = A (partisi di super hanya diisi slot A)
-if command -v bootctl >/dev/null 2>&1; then
-    if bootctl set-active-boot-slot 0 >/dev/null 2>&1; then
-        ui_print "- Slot aktif: A"
-    else
-        ui_print "! Gagal set slot A, pilih Slot A manual di menu Reboot"
-    fi
-else
-    ui_print "! bootctl tidak ada, pilih Slot A manual di menu Reboot"
+elif command -v lptools >/dev/null 2>&1; then
+    for lp in system system_ext product vendor odm mi_ext vendor_dlkm system_dlkm odm_dlkm; do
+        if [ -e "/dev/block/mapper/$lp" ]; then
+            lptools unmap "$lp" >/dev/null 2>&1 || true
+            lptools map "$lp" >/dev/null 2>&1 || true
+        fi
+    done
 fi
 
 progress 1.0
 rm -rf "$TMPD"
 ui_print " "
 ui_print "=========================================="
-ui_print " Selesai! Reboot > System"
+ui_print " اكتمل التفليش! اختر Reboot System الآن"
 ui_print "=========================================="
 exit 0
