@@ -57,6 +57,7 @@ jobs:
             ca-certificates curl wget unzip zip tar p7zip-full lz4 git \
             python3 python3-pip e2fsprogs android-sdk-libsparse-utils \
             build-essential pkg-config libssl-dev clang
+          pip install --break-system-packages -q gdown || pip install -q gdown || true
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -119,7 +120,6 @@ jobs:
           cd "$OUT_FW"
 
           if command -v samloader >/dev/null 2>&1; then
-            samloader download --help || true
             samloader check-update --model "$SAM_MODEL" --region "$SAM_CSC" || true
             EXTRA_ARGS=()
             if samloader download --help 2>&1 | grep -q -- '--imei'; then
@@ -179,31 +179,26 @@ jobs:
           COOKIE_JAR="$GITHUB_WORKSPACE/work/port_dl/gdrive_cookies.txt"
           rm -f "$OUT_ZIP" "$COOKIE_JAR"
 
-          extract_gdrive_id() {
-            local url="$1"
-            if [[ "$url" =~ /file/d/([a-zA-Z0-9_-]+) ]]; then
-              printf '%s\n' "${BASH_REMATCH[1]}"
-              return 0
+          if printf '%s' "$PORT_ROM_URL" | grep -q 'drive\.google\.com'; then
+            FILE_ID=$(printf '%s' "$PORT_ROM_URL" | grep -oE '/file/d/[a-zA-Z0-9_-]+' | sed 's|/file/d/||' | head -n 1 || true)
+            if [[ -z "$FILE_ID" ]]; then
+              FILE_ID=$(printf '%s' "$PORT_ROM_URL" | grep -oE '[?&]id=[a-zA-Z0-9_-]+' | sed 's/^[?&]id=//' | head -n 1 || true)
             fi
-            if [[ "$url" =~ [?&]id=([a-zA-Z0-9_-]+) ]]; then
-              printf '%s\n' "${BASH_REMATCH[1]}"
-              return 0
-            fi
-            return 1
-          }
+            [[ -n "$FILE_ID" ]] || { echo "Could not extract Google Drive file ID from URL" >&2; exit 1; }
 
-          if [[ "$PORT_ROM_URL" =~ drive\.google\.com ]]; then
-            FILE_ID=$(extract_gdrive_id "$PORT_ROM_URL") || {
-              echo "Could not extract Google Drive file ID from URL" >&2
-              exit 1
-            }
             echo "Detected Google Drive file ID, downloading..."
-            curl -fsSL -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-              "https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t" \
-              -o "$OUT_ZIP" || \
-            curl -fsSL -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
-              "https://drive.google.com/uc?export=download&id=${FILE_ID}&confirm=t" \
-              -o "$OUT_ZIP"
+            if command -v gdown >/dev/null 2>&1; then
+              gdown --fuzzy "https://drive.google.com/uc?id=${FILE_ID}" -O "$OUT_ZIP" || true
+            fi
+
+            if [[ ! -s "$OUT_ZIP" ]]; then
+              curl -fsSL -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+                "https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t" \
+                -o "$OUT_ZIP" || \
+              curl -fsSL -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+                "https://drive.google.com/uc?export=download&id=${FILE_ID}&confirm=t" \
+                -o "$OUT_ZIP"
+            fi
           else
             echo "Downloading direct donor ROM URL..."
             curl -fsSL "$PORT_ROM_URL" -o "$OUT_ZIP"
