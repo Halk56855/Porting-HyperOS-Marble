@@ -54,22 +54,25 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            ca-certificates curl wget unzip zip tar p7zip-full lz4 \
+            ca-certificates curl wget unzip zip tar p7zip-full lz4 git \
             python3 python3-pip e2fsprogs android-sdk-libsparse-utils \
             build-essential pkg-config libssl-dev clang
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo
+      - name: Cache Cargo and samloader-rs
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+            ~/samloader-rs/target
+          key: samloader-rs-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install samloader-rs or samloader fallback
+      - name: Setup samloader-rs
+        env:
+          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
 
@@ -78,25 +81,32 @@ jobs:
             exit 0
           fi
 
-          if cargo install samloader-rs --locked 2>/dev/null || cargo install samloader-rs 2>/dev/null; then
-            if command -v samloader-rs >/dev/null 2>&1; then
-              samloader-rs --version || true
-              exit 0
+          rm -rf "$HOME/samloader-rs"
+          if git clone --depth=1 https://github.com/topjohnwu/samloader-rs.git "$HOME/samloader-rs"; then
+            cargo install --path "$HOME/samloader-rs" --locked || \
+              cargo install --path "$HOME/samloader-rs" || \
+              cargo build --manifest-path "$HOME/samloader-rs/Cargo.toml" --release
+            if [[ -f "$HOME/samloader-rs/target/release/samloader-rs" ]]; then
+              sudo cp -f "$HOME/samloader-rs/target/release/samloader-rs" /usr/local/bin/samloader-rs
             fi
           fi
 
-          pip install --break-system-packages -q samloader || pip install -q samloader
-          command -v samloader >/dev/null 2>&1 && samloader --version || echo "Using samloader python fallback"
+          if ! command -v samloader-rs >/dev/null 2>&1; then
+            cargo install samloader --locked || cargo install samloader
+          fi
+
+          command -v samloader-rs >/dev/null 2>&1 && samloader-rs --version || true
+          command -v samloader >/dev/null 2>&1 && samloader --version || true
 
       - name: Prepare directories and permissions
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/work/base_src" "$GITHUB_WORKSPACE/work/port_dl" "$GITHUB_WORKSPACE/out"
+          mkdir -p "$GITHUB_WORKSPACE/work/base_fw" "$GITHUB_WORKSPACE/work/base_src" "$GITHUB_WORKSPACE/work/port_dl" "$GITHUB_WORKSPACE/out"
           chmod +x scripts/port.sh || true
           for f in scripts/port_*.sh scripts/update-binary; do
             [[ -f "$f" ]] && chmod +x "$f" || true
           done
 
-      - name: Download official SM-A045F firmware
+      - name: Download official SM-A045F firmware via samloader-rs
         env:
           SAM_MODEL: ${{ inputs.model }}
           SAM_CSC: ${{ inputs.csc }}
@@ -107,10 +117,11 @@ jobs:
           OUT_FW="$GITHUB_WORKSPACE/work/base_fw"
           mkdir -p "$OUT_FW"
 
+          AUTH_ARGS=()
+          [[ -n "${SAM_IMEI:-}" ]] && AUTH_ARGS+=(--imei "$SAM_IMEI")
+          [[ -n "${SAM_SERIAL:-}" ]] && AUTH_ARGS+=(--serial "$SAM_SERIAL")
+
           if command -v samloader-rs >/dev/null 2>&1; then
-            AUTH_ARGS=()
-            [[ -n "${SAM_IMEI:-}" ]] && AUTH_ARGS+=(--imei "$SAM_IMEI")
-            [[ -n "${SAM_SERIAL:-}" ]] && AUTH_ARGS+=(--serial "$SAM_SERIAL")
             samloader-rs checkupdate -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" || true
             samloader-rs download -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW" || \
               samloader-rs pull -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW"
@@ -124,7 +135,7 @@ jobs:
             # shellcheck disable=SC2086
             samloader -m "$SAM_MODEL" -r "$SAM_CSC" $IMEI_ARG download -v "$FW_VER" -O "$OUT_FW"
           else
-            echo "Error: Neither samloader-rs nor samloader is available." >&2
+            echo "Error: Neither samloader-rs nor samloader binary is available." >&2
             exit 1
           fi
 
@@ -140,7 +151,6 @@ jobs:
           mkdir -p "$DST_IMG" "$TMP_UNPACK"
 
           find "$SRC_FW" -maxdepth 2 -type f -name '*.zip' -exec unzip -q -o {} -d "$TMP_UNPACK" \;
-          find "$SRC_FW" -maxdepth 2 -type f \( -name '*.enc4' -o -name '*.enc2' \) -exec cp -f {} "$TMP_UNPACK/" \;
           find "$SRC_FW" -maxdepth 2 -type f \( -name '*.tar' -o -name '*.tar.md5' \) -exec tar -xf {} -C "$TMP_UNPACK" \;
 
           while IFS= read -r -d '' t; do
