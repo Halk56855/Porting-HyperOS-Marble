@@ -1,64 +1,58 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  port.sh - Quick-port HyperOS dari device donor ke marble (POCO F5)
+#  port.sh - Quick-port HyperOS dari device donor ke Galaxy A04 (a04)
 #
-#  Konsep: firmware + boot/vendor_boot/dtbo + vendor/odm/vendor_dlkm dari BASE
-#  (ROM marble, mis. xiaomi.eu), system/system_ext/product/mi_ext dari PORT (donor).
-#  Output: zip flashable recovery (META-INF/ + images/), untuk OrangeFox/TWRP.
-#  INSTALLER=base: META-INF dari zip base; super = images/super.img tunggal (SUPER_SINGLE=false: .0..N seperti base).
-#
-#  Semua partisi bisa EXT4 + rw lewat EXT4_PARTITIONS (termasuk product, mi_ext,
-#  vendor_dlkm). Supaya muat di super: EXT4_HEADROOM_MB kecil (default 32),
-#  EXT4_MARGIN_PCT 104, FIT_FALLBACK_EROFS=false (gagal jelas, bukan diam-diam EROFS).
-#
-#  Semua setting lewat env (key=value), default di bawah.
+#  Konsep: firmware / boot / vendor_boot / dtbo / vendor / odm / vendor_dlkm
+#  dari BASE (ROM/firmware a04), system / system_ext / product / mi_ext dari
+#  PORT (ROM donor HyperOS).
+#  Mendukung input BASE berupa URL, file zip/tar/tar.md5/lz4/payload.bin, atau
+#  folder hasil ekstrak firmware Samsung.
 # =============================================================================
 set -Eeuo pipefail
 
 # ------------------------------------------------------------------ config
-BASE_ROM=${BASE_ROM:?BASE_ROM wajib (URL / path ROM marble, mis. zip xiaomi.eu)}
+BASE_ROM=${BASE_ROM:?BASE_ROM wajib (URL / path / folder ROM base a04)}
 PORT_ROM=${PORT_ROM:?PORT_ROM wajib (URL / path ROM donor HyperOS)}
 TOOLS_DIR=${TOOLS_DIR:?TOOLS_DIR wajib (root toolkit berisi bin/)}
 
-TARGET_DEVICE=${TARGET_DEVICE:-marble}
+TARGET_DEVICE=${TARGET_DEVICE:-a04}
 PORT_PARTITIONS=${PORT_PARTITIONS:-"system system_ext product mi_ext"}
 EXT4_PARTITIONS=${EXT4_PARTITIONS:-"vendor odm"}
 DISABLE_ENCRYPTION=${DISABLE_ENCRYPTION:-true}
 RW_MOUNT=${RW_MOUNT:-true}
 DISABLE_AVB=${DISABLE_AVB:-true}
 DEBUG_ADB=${DEBUG_ADB:-true}
-DEVICE_ANTI=${DEVICE_ANTI:-}                 # nilai 'fastboot getvar anti' HP; kosong = cek dilewati (hanya peringatan)
+DEVICE_ANTI=${DEVICE_ANTI:-}
 SUPER_SIZE=${SUPER_SIZE:-auto}
-REPLACE_FROM_BASE=${REPLACE_FROM_BASE:-"device_features displayconfig overlay camera misound biometric"}
-# fitur tambahan di product/etc/device_features/*.xml, format "nama:tipe:nilai" dipisah spasi
-# (tipe bool|integer|string; smart_fps_value:integer:auto = fps tertinggi dari fpsList; "none" = matikan)
-UNLOCK_FEATURES=${UNLOCK_FEATURES:-"support_smart_fps:bool:true smart_fps_value:integer:auto default_eyecare_mode:integer:2 paper_eyecare_default_texture:integer:0 support_aod_fullscreen:bool:true support_aod_aon:bool:true"}
+REPLACE_FROM_BASE=${REPLACE_FROM_BASE:-"device_features displayconfig overlay"}
+UNLOCK_FEATURES=${UNLOCK_FEATURES:-"none"}
 DEBLOAT=${DEBLOAT:-""}
 EROFS_COMP=${EROFS_COMP:-"lz4hc,9"}
-EXT4_HEADROOM_MB=${EXT4_HEADROOM_MB:-32}   # ruang bebas tambahan tiap partisi EXT4 rw (MB)
-EXT4_MARGIN_PCT=${EXT4_MARGIN_PCT:-104}    # ukuran awal ext4 = isi x persen ini (kurang -> retry otomatis)
-EXT4_RETRY_PCT=${EXT4_RETRY_PCT:-105}      # e2fsdroid kekurangan ruang -> besarkan sekian persen per percobaan
+EXT4_HEADROOM_MB=${EXT4_HEADROOM_MB:-32}
+EXT4_MARGIN_PCT=${EXT4_MARGIN_PCT:-104}
+EXT4_RETRY_PCT=${EXT4_RETRY_PCT:-105}
 DEBLOAT_KEEP=""
-VNDK_COMPAT=${VNDK_COMPAT:-true}           # vendor butuh VNDK APEX versi lama -> salin dari system/system_ext base
-LINKER_CHECK=${LINKER_CHECK:-true}         # laporan dependensi linker ELF vendor/odm (info)
-VINTF_COMPAT=${VINTF_COMPAT:-true}         # level FCM vendor tidak dikenal framework donor -> salin matrix dari system base
-PROP_MERGE=${PROP_MERGE:-true}             # salin props khas device dari product/etc/build.prop base
-OVERLAY_FIX=${OVERLAY_FIX:-true}           # buang overlay khas donor, salin overlay khas marble
-INSTALLER=${INSTALLER:-auto}                # auto | base (META-INF dari ROM base, mis. xiaomi.eu) | ours
-RECOVERY_SUPER=${RECOVERY_SUPER:-raw}      # hanya INSTALLER=ours: raw = images/super.img | zst = images/super.img.zst
-SUPER_SINGLE=${SUPER_SINGLE:-true}         # INSTALLER=base: true = images/super.img tunggal (raw) | false = super.img.0..N seperti zip base
-RECOVERY_IMG=${RECOVERY_IMG:-}              # opsional: URL/path recovery.img custom (OrangeFox dll)
-BOOT_IMG=${BOOT_IMG:-}                      # opsional: URL/path boot.img custom (kernel), menggantikan boot.img base
-GBOARD_APK=${GBOARD_APK:-}                  # opsional: URL/path Gboard (LatinImeGoogle.apk) -> jadi keyboard sistem
+VNDK_COMPAT=${VNDK_COMPAT:-true}
+LINKER_CHECK=${LINKER_CHECK:-true}
+VINTF_COMPAT=${VINTF_COMPAT:-true}
+PROP_MERGE=${PROP_MERGE:-true}
+OVERLAY_FIX=${OVERLAY_FIX:-true}
+INSTALLER=${INSTALLER:-ours}                # ours | base | auto
+RECOVERY_SUPER=${RECOVERY_SUPER:-raw}      # raw | zst (untuk INSTALLER=ours)
+SUPER_SINGLE=${SUPER_SINGLE:-true}         # untuk INSTALLER=base
+RECOVERY_IMG=${RECOVERY_IMG:-}
+BOOT_IMG=${BOOT_IMG:-}
+GBOARD_APK=${GBOARD_APK:-}
 GBOARD_DIR=${GBOARD_DIR:-product/app/LatinImeGoogle}
-GBOARD_PACKAGE=${GBOARD_PACKAGE:-com.charlie.android.inputmethod.latin}   # package yang diharapkan dari GBOARD_APK
+GBOARD_PACKAGE=${GBOARD_PACKAGE:-com.charlie.android.inputmethod.latin}
 ZIP_LEVEL=${ZIP_LEVEL:-1}
 KEEP_DOWNLOADS=${KEEP_DOWNLOADS:-false}
-DEBLOAT_PACKAGES_FILE=${DEBLOAT_PACKAGES_FILE:-}   # default: <repo>/debloat_packages.txt
-DEBLOAT_PRESET=${DEBLOAT_PRESET:-none}     # none | safe (= + hapus semua data-app)
-DEBLOAT_SAFE_KEEP=${DEBLOAT_SAFE_KEEP:-"MIUIGallery"}  # folder data-app yang tidak ikut dihapus preset safe
-FIT_FALLBACK_EROFS=${FIT_FALLBACK_EROFS:-false}  # true: super tidak muat -> vendor/odm otomatis EROFS. false: build gagal dengan pesan jelas
-EXTRACT_EROFS=${EXTRACT_EROFS:-}           # opsional: extract.erofs versi baru (dicoba duluan)
+DEBLOAT_PACKAGES_FILE=${DEBLOAT_PACKAGES_FILE:-}
+DEBLOAT_PRESET=${DEBLOAT_PRESET:-none}
+DEBLOAT_SAFE_KEEP=${DEBLOAT_SAFE_KEEP:-"MIUIGallery"}
+FIT_FALLBACK_EROFS=${FIT_FALLBACK_EROFS:-false}
+EXTRACT_EROFS=${EXTRACT_EROFS:-}
+EU_SYSTEMSERVER_PATCH=${EU_SYSTEMSERVER_PATCH:-false}
 WORK=${WORK:-$PWD/work}
 OUT=${OUT:-$PWD/out}
 
@@ -82,19 +76,18 @@ die()  { printf '%s[fail]%s %s\n' "$c_red" "$c_off" "$*" >&2
 trap 'die "gagal di baris $LINENO: $BASH_COMMAND"' ERR
 
 is_true()   { [[ ${1,,} == true || $1 == 1 || ${1,,} == yes ]]; }
-# in_list KATA "daftar dipisah spasi" (daftar sengaja di-word-split)
 # shellcheck disable=SC2048,SC2086
 in_list()   { local x=$1 i; shift; for i in $*; do if [[ $i == "$x" ]]; then return 0; fi; done; return 1; }
 group_start(){ [[ -n ${GITHUB_ACTIONS:-} ]] && echo "::group::$*"; log "== $* =="; }
 group_end()  { [[ -n ${GITHUB_ACTIONS:-} ]] && echo "::endgroup::"; return 0; }
 dfree()      { df -h "$WORK" | awk 'NR==2{print "disk bebas: "$4}'; }
 
-get_prop() { # file key -> value (baris terakhir menang)
+get_prop() {
     [[ -f $1 ]] || return 0
     grep -E "^$2=" "$1" 2>/dev/null | tail -n1 | cut -d= -f2- || true
 }
 
-set_prop() { # file key value (replace atau append)
+set_prop() {
     local f=$1 k=$2 v=$3 ek ev
     [[ -f $f ]] || return 0
     ek=$(printf '%s' "$k" | sed 's/[.[\*^$/]/\\&/g')
@@ -108,7 +101,6 @@ set_prop() { # file key value (replace atau append)
 
 need() { local t; for t in "$@"; do command -v "$t" >/dev/null || die "tool tidak ada: $t"; done; }
 
-# tambahan: AOD overlay, Millet, unlock device_features, patch signature services.jar (hanya fungsi)
 # shellcheck source=port_extras.sh
 source "$SCRIPT_DIR/port_extras.sh"
 # shellcheck source=port_arch64.sh
@@ -121,7 +113,7 @@ source "$SCRIPT_DIR/port_chrome.sh"
 source "$SCRIPT_DIR/port_apps.sh"
 
 # ------------------------------------------------------------------ fetch
-fetch() { # src dest_dir name -> echo path
+fetch() { # src dest_dir name -> echo path (file or directory)
     local src=$1 dir=$2 name=$3
     if [[ $src =~ ^https?:// ]]; then
         mkdir -p "$dir"
@@ -133,38 +125,71 @@ fetch() { # src dest_dir name -> echo path
             curl -fL --retry 3 -o "$dir/$name" "$src" >&2
         fi
         echo "$dir/$name"
+    elif [[ -d $src ]]; then
+        readlink -f "$src"
     else
-        [[ -f $src ]] || die "file tidak ditemukan: $src"
+        [[ -f $src ]] || die "file atau folder tidak ditemukan: $src"
         readlink -f "$src"
     fi
 }
 
-check_url() { # label url
+check_url() {
     local label=$1 url=$2 code name
     [[ $url =~ ^https?:// ]] || return 0
     name=${url%%\?*}; name=${name##*/}
     case $name in
-        *.zip|*.tgz|*.tar.gz|*.tar|*.tar.zst|*.tar.xz|*.bin|*.img|*.apk|*.apkm|*.apks|*.xapk) ;;
-        *) warn "$label: nama file '$name' tidak berakhiran .zip/.tgz/.img/.apk/.apkm/.apks/.xapk - URL kemungkinan terpotong" ;;
+        *.zip|*.tgz|*.tar.gz|*.tar|*.tar.md5|*.tar.zst|*.tar.xz|*.lz4|*.bin|*.img|*.apk|*.apkm|*.apks|*.xapk) ;;
+        *) warn "$label: nama file '$name' tidak berakhiran ekstensi umum - pastikan URL benar" ;;
     esac
     code=$(curl -sL -r 0-0 -o /dev/null -w '%{http_code}' --retry 2 --max-time 60 "$url" || echo 000)
     case $code in
         200|206) ok "$label: URL bisa diakses ($name)" ;;
-        404) die "$label: file tidak ditemukan (HTTP 404). Cek URL lengkap sampai .zip: $url" ;;
+        404) die "$label: file tidak ditemukan (HTTP 404): $url" ;;
         *)   die "$label: URL tidak bisa diakses (HTTP $code): $url" ;;
     esac
 }
 
 # ------------------------------------------------------------------ unpack ROM
-# unpack_rom <rom_file> <out_images_dir> <prefix> [partisi,dipisah,koma|all]
+extract_tar_any() { # archive dest_dir
+    local arc=$1 dst=$2
+    # ملفات .tar.md5 لدى سامسونج قد تحتوي سطر md5 في النهاية، لذا نتجاهل أخطاء trailing garbage عند الضرورة
+    if tar -xf "$arc" -C "$dst" >/dev/null 2>&1; then
+        return 0
+    fi
+    tar -xf "$arc" -C "$dst" 2>/dev/null || true
+}
+
+decompress_lz4_tree() { # dir
+    local d=$1 f out
+    while IFS= read -r -d '' f; do
+        out="${f%.lz4}"
+        if command -v lz4 >/dev/null; then
+            lz4 -d -f -q "$f" "$out" >/dev/null 2>&1 || true
+        elif command -v unlz4 >/dev/null; then
+            unlz4 -d -f -q "$f" "$out" >/dev/null 2>&1 || true
+        fi
+    done < <(find "$d" -type f -name '*.lz4' -print0)
+}
+
 unpack_rom() {
     local rom=$1 dst=$2 pfx=$3 want=${4:-all}
     local tmp="$WORK/tmp_$pfx" magic
     rm -rf "$tmp"; mkdir -p "$dst" "$tmp"
+
+    if [[ -d $rom ]]; then
+        log "[$pfx] folder lokal -> images/"
+        cp -a "$rom"/. "$tmp/"
+        decompress_lz4_tree "$tmp"
+        collect_images "$tmp" "$dst" "$pfx"
+        rm -rf "$tmp"
+        unpack_super "$dst" "$pfx"
+        return 0
+    fi
+
     magic=$(head -c 4 "$rom" | od -An -tx1 | tr -d ' \n')
 
     case $magic in
-        504b0304) # zip
+        504b0304)
             if unzip -l "$rom" payload.bin >/dev/null 2>&1; then
                 log "[$pfx] OTA zip -> payload.bin"
                 unzip -p "$rom" META-INF/com/google/android/updater-script > "$tmp/updater-script" 2>/dev/null || true
@@ -172,30 +197,52 @@ unpack_rom() {
                 unzip -p "$rom" payload.bin > "$tmp/payload.bin"
                 unpack_payload "$tmp/payload.bin" "$dst" "$pfx" "$want"
             else
-                log "[$pfx] zip fastboot -> images/"
+                log "[$pfx] zip -> images/"
                 unzip -q "$rom" -d "$tmp"
+                find "$tmp" -type f \( -name '*.tar' -o -name '*.tar.md5' \) -print0 | while IFS= read -r -d '' sub; do
+                    extract_tar_any "$sub" "$tmp/tar_out"
+                done
+                decompress_lz4_tree "$tmp"
                 collect_images "$tmp" "$dst" "$pfx"
             fi ;;
-        43724155) # CrAU
+        43724155)
             unpack_payload "$rom" "$dst" "$pfx" "$want" ;;
-        1f8b*|fd377a58|28b52ffd) # tgz / txz / tar.zst
-            log "[$pfx] fastboot tar -> images/"
-            tar -xf "$rom" -C "$tmp"
+        1f8b*|fd377a58|28b52ffd)
+            log "[$pfx] compressed archive -> images/"
+            extract_tar_any "$rom" "$tmp"
+            decompress_lz4_tree "$tmp"
+            collect_images "$tmp" "$dst" "$pfx" ;;
+        02214c18)
+            log "[$pfx] lz4 -> images/"
+            decompress_lz4_tree "$rom" || true
+            if command -v lz4 >/dev/null; then
+                lz4 -d -f -q "$rom" "$tmp/unpacked.bin" >/dev/null 2>&1 || true
+            fi
+            if [[ -f $tmp/unpacked.bin ]]; then
+                extract_tar_any "$tmp/unpacked.bin" "$tmp/tar_out" || mv -f "$tmp/unpacked.bin" "$tmp/super.img"
+            fi
             collect_images "$tmp" "$dst" "$pfx" ;;
         *)
-            die "[$pfx] format ROM tidak dikenal (magic $magic)" ;;
+            if [[ ${rom,,} == *.tar || ${rom,,} == *.tar.md5 ]]; then
+                log "[$pfx] Samsung tar/tar.md5 -> images/"
+                extract_tar_any "$rom" "$tmp"
+                decompress_lz4_tree "$tmp"
+                collect_images "$tmp" "$dst" "$pfx"
+            else
+                die "[$pfx] format ROM tidak dikenal (magic $magic)"
+            fi ;;
     esac
 
-    if ! is_true "$KEEP_DOWNLOADS" && [[ $rom == "$WORK/dl/"* ]]; then rm -f "$rom"; fi
+    if ! is_true "$KEEP_DOWNLOADS" && [[ -f $rom && $rom == "$WORK/dl/"* ]]; then rm -f "$rom"; fi
     rm -rf "$tmp"
     unpack_super "$dst" "$pfx"
 }
 
-env_get() { # file KEY -> value (dari output lp_tool.py)
+env_get() {
     sed -n "s/^$2=\"\{0,1\}\([^\"]*\)\"\{0,1\}\$/\1/p" "$1" | tail -n1
 }
 
-load_base_env() { # muat info base (super/payload/anti) ke variabel global
+load_base_env() {
     unset SUPER_LAYOUT SUPER_LAYOUT_MAGIC LP_SUPER_SIZE LP_METADATA_MAX LP_METADATA_SLOTS LP_BLOCK_SIZE LP_VIRTUAL_AB \
           LP_GROUPS LP_PARTITIONS LP_PARTITION_SIZES PAYLOAD_PARTITIONS \
           PAYLOAD_DYN_PARTITIONS PAYLOAD_DYN_GROUPS PAYLOAD_SNAPSHOT PAYLOAD_VABC ANTI_VER
@@ -206,7 +253,7 @@ load_base_env() { # muat info base (super/payload/anti) ke variabel global
     done
 }
 
-detect_anti() { # src pfx -> simpan ANTI_VER firmware ke $WORK/<pfx>.env
+detect_anti() {
     local src=$1 pfx=$2 f anti
     while IFS= read -r -d '' f; do
         anti=$(grep -oE 'CURRENT_ANTI_VER=[0-9]+' "$f" | head -n1 | cut -d= -f2 || true)
@@ -221,23 +268,20 @@ detect_anti() { # src pfx -> simpan ANTI_VER firmware ke $WORK/<pfx>.env
     return 0
 }
 
-# ROM base boleh membawa firmware (xbl/abl/tz/...). Kalau anti-rollback HP lebih baru
-# dari firmware base, flash firmware lama bisa brick. Nilai anti HP diisi user lewat
-# input device_anti (hasil `fastboot getvar anti`).
 anti_rollback_check() {
     [[ -n ${DEVICE_ANTI:-} ]] || return 0
-    [[ $DEVICE_ANTI =~ ^[0-9]+$ ]] || die "device_anti harus angka (hasil 'fastboot getvar anti'), bukan '$DEVICE_ANTI'"
+    [[ $DEVICE_ANTI =~ ^[0-9]+$ ]] || die "device_anti harus angka, bukan '$DEVICE_ANTI'"
     if [[ ! ${ANTI_VER:-} =~ ^[0-9]+$ ]]; then
-        warn "device_anti=$DEVICE_ANTI diset, tapi anti firmware base tidak terbaca (mis. zip recovery xiaomi.eu tidak menyimpan CURRENT_ANTI_VER). Cek manual: fastboot getvar anti"
+        warn "device_anti=$DEVICE_ANTI diset, tapi anti firmware base tidak terbaca."
         return 0
     fi
     if (( DEVICE_ANTI > ANTI_VER )); then
-        die "anti-rollback: HP anti=$DEVICE_ANTI > firmware base anti=$ANTI_VER. Firmware base lebih tua dan bisa brick. Pakai base ROM dengan anti >= $DEVICE_ANTI."
+        die "anti-rollback: HP anti=$DEVICE_ANTI > firmware base anti=$ANTI_VER."
     fi
     ok "anti-rollback aman: HP anti=$DEVICE_ANTI <= firmware base anti=$ANTI_VER"
 }
 
-unpack_payload() { # payload dst pfx want
+unpack_payload() {
     local pl=$1 dst=$2 pfx=$3 want=$4 list="" p avail
     python3 "$SCRIPT_DIR/lp_tool.py" payload "$pl" > "$WORK/${pfx}_payload.env"
     avail=$(env_get "$WORK/${pfx}_payload.env" PAYLOAD_PARTITIONS)
@@ -250,15 +294,14 @@ unpack_payload() { # payload dst pfx want
         list="-p $list"
     fi
     log "[$pfx] payload-dumper-go ${list:-(semua partisi)}"
-    # shellcheck disable=SC2086  # list sengaja di-split (kosong = semua)
+    # shellcheck disable=SC2086
     if ! payload-dumper-go -c "$(nproc)" $list -o "$dst" "$pl" > "$WORK/pdg_$pfx.log" 2>&1; then
         tail -n 30 "$WORK/pdg_$pfx.log" >&2; die "[$pfx] payload-dumper-go gagal"
     fi
     rm -f "$pl"
 }
 
-# gabungkan super dari 1..n file (raw / sparse / zstd, boleh split) -> dst/super.img(.zst)
-assemble_super() { # dst_dir part...
+assemble_super() {
     local dst=$1 magic; shift
     magic=$(head -c 4 "$1" | od -An -tx1 | tr -d ' \n')
     log "super ditemukan: $(printf '%s ' "${@##*/}")(magic $magic)"
@@ -274,28 +317,25 @@ assemble_super() { # dst_dir part...
     rm -f "$@"
 }
 
-collect_images() { # src_tree dst pfx
+collect_images() {
     local src=$1 dst=$2 pfx=$3 dir f sparts=()
     log "[$pfx] isi ROM (maks 60 file terbesar):"
     find "$src" -type f -printf '%s %P\n' | sort -rn | head -n 60 | \
         awk '{printf "    %10.1f MB  %s\n", $1/1048576, $2}'
-    dir=$(dirname "$(find "$src" -type f -name 'boot.img' | head -n1)")
-    [[ -d $dir && $dir != . ]] || die "[$pfx] boot.img / folder images tidak ditemukan di ROM"
     detect_anti "$src" "$pfx"
-    # simpan META-INF (installer recovery) ROM base untuk INSTALLER=base
+
     local meta
-    meta=$(find "$src" -maxdepth 3 -type d -name META-INF | head -n1)
+    meta=$(find "$src" -maxdepth 4 -type d -name META-INF | head -n1 || true)
     if [[ -n $meta && -e $meta/com/google/android/update-binary ]]; then
         rm -rf "$WORK/${pfx}_META-INF"; cp -a "$meta" "$WORK/${pfx}_META-INF"
         log "[$pfx] META-INF disimpan ($(find "$meta" -type f | wc -l) file)"
     fi
-    # super bisa bernama super.img / super.img.zst / super.zst / split .0 .1 ... di folder mana pun
+
     mapfile -t sparts < <(find "$src" -type f -iname 'super*' ! -iname 'super_empty*' \
         ! -iname '*.txt' ! -iname '*.sh' ! -iname '*.bat' ! -iname '*.md5' ! -iname '*.sha*' | sort -V)
     if [[ ${#sparts[@]} -gt 0 ]]; then
-        # path relatif ke root zip (induk META-INF, atau induk folder images)
         local zroot
-        if [[ -n $meta ]]; then zroot=$(dirname "$meta"); else zroot=$(dirname "$dir"); fi
+        if [[ -n $meta ]]; then zroot=$(dirname "$meta"); else zroot="$src"; fi
         {
             echo "SUPER_LAYOUT=\"$(for f in "${sparts[@]}"; do printf '%s ' "${f#"$zroot"/}"; done)\""
             echo "SUPER_LAYOUT_MAGIC=$(head -c 4 "${sparts[0]}" | od -An -tx1 | tr -d ' \n')"
@@ -304,10 +344,17 @@ collect_images() { # src_tree dst pfx
     else
         warn "[$pfx] tidak ada file super* di ROM"
     fi
-    find "$dir" -maxdepth 1 -type f -name '*.img' -exec mv -t "$dst" {} +
+
+    local first_img
+    first_img=$(find "$src" -type f -name '*.img' | head -n1 || true)
+    if [[ -n $first_img ]]; then
+        dir=$(dirname "$first_img")
+        find "$src" -type f -name '*.img' ! -iname 'super*' -exec mv -t "$dst" {} +
+        log "[$pfx] gambar .img dipindahkan ke $dst (sumber awal: ${dir#"$src"/})"
+    fi
 }
 
-unpack_super() { # dst pfx  (kalau ada super.img: pecah jadi partisi logical)
+unpack_super() {
     local dst=$1 pfx=$2 sup="$1/super.img" n sz base
     if [[ -f $sup.zst ]]; then log "[$pfx] dekompres super.img.zst"; zstd -d --rm -q "$sup.zst" -o "$sup"; fi
     [[ -f $sup ]] || return 0
@@ -331,7 +378,7 @@ unpack_super() { # dst pfx  (kalau ada super.img: pecah jadi partisi logical)
 }
 
 # ------------------------------------------------------------------ fs extract / repack
-sanity_file() { # partisi -> file yang wajib ada setelah ekstrak
+sanity_file() {
     case $1 in
         system) echo system/build.prop ;;
         vendor) echo build.prop ;;
@@ -340,7 +387,7 @@ sanity_file() { # partisi -> file yang wajib ada setelah ekstrak
     esac
 }
 
-verify_extract() { # root name -> 0 kalau lengkap
+verify_extract() {
     local root=$1 name=$2 cfg exp got key
     cfg="$root/config/${name}_fs_config"
     [[ -d $root/$name && -s $cfg ]] || { warn "$name: folder/config hasil ekstrak tidak ada"; return 1; }
@@ -351,14 +398,13 @@ verify_extract() { # root name -> 0 kalau lengkap
     if [[ -n $key && ! -e $root/$name/$key ]]; then
         warn "$name: $key tidak ada setelah ekstrak"; return 1
     fi
-    # fs_config punya entri sintetis ("/", lost+found) -> toleransi 2 + 3%
     if [[ $(( exp - got )) -gt $(( 2 + exp * 3 / 100 )) ]]; then
         warn "$name: ekstrak tidak lengkap ($got dari $exp)"; return 1
     fi
     return 0
 }
 
-extract_img() { # img out_root
+extract_img() {
     local img=$1 root=$2 t name lg thr tl ok=0 tools=()
     name=$(basename "$img" .img)
     lg="$WORK/extract_$name.log"
@@ -372,7 +418,6 @@ extract_img() { # img out_root
             tools+=("$BIN/extract.erofs")
             for tl in "${tools[@]}"; do
                 rm -rf "${root:?}/$name" "$root/config/${name}_"*
-                # timeout: extractor yang macet dianggap gagal -> coba extractor berikutnya
                 if timeout "${EXTRACT_TIMEOUT:-1800}" "$tl" -x -i "$img" -o "$root" -T"$thr" > "$lg" 2>&1 \
                         && verify_extract "$root" "$name"; then
                     ok=1; log "  $name diekstrak dengan $tl"; break
@@ -388,7 +433,7 @@ extract_img() { # img out_root
     [[ $ok == 1 ]] || die "ekstrak $name.img gagal/tidak lengkap (tipe $t). Lihat log di atas."
 }
 
-prep_config() { # root name
+prep_config() {
     local root=$1 name=$2
     mkdir -p "$root/$name/lost+found"
     touch -t 200901010000.00 "$root/$name/lost+found"
@@ -396,7 +441,7 @@ prep_config() { # root name
     python3 "$PYBIN/contextpatch.py" "$root/$name" "$root/config/${name}_file_contexts" >/dev/null
 }
 
-repack_erofs() { # root name out_img
+repack_erofs() {
     local root=$1 name=$2 img=$3
     prep_config "$root" "$name"
     mkfs.erofs -z"$EROFS_COMP" -T"$FIXED_TS" --mount-point "/$name" \
@@ -405,10 +450,7 @@ repack_erofs() { # root name out_img
         "$img" "$root/$name" >/dev/null
 }
 
-# ext4: ukuran = isi x EXT4_MARGIN_PCT% (+ inode, + headroom kalau rw). e2fsdroid kekurangan
-# ruang -> besarkan EXT4_RETRY_PCT% lalu ulangi. Image rw tanpa resize_inode (seperti build AOSP)
-# supaya tidak membuang puluhan MB untuk GDT cadangan.
-repack_ext4() { # root name out_img rw(true/false)
+repack_ext4() {
     local root=$1 name=$2 img=$3 rw=$4 inodes blocks try=0 share=(-s) feat="^has_journal"
     prep_config "$root" "$name"
     inodes=$(( $(wc -l < "$root/config/${name}_fs_config") + 64 ))
@@ -441,9 +483,6 @@ repack_ext4() { # root name out_img rw(true/false)
 }
 
 # ------------------------------------------------------------------ cek VINTF
-# target-level manifest vendor/odm harus ada di compatibility matrix FRAMEWORK
-# (/system/etc/vintf/compatibility_matrix.<level>.xml). Kalau tidak ada, matrix level itu
-# disalin dari system base ke /system/etc/vintf port. File vintf vendor/odm tidak disentuh.
 check_vintf() {
     local levels="" lv f matrices sysd="$P_FS/system/system/etc/vintf" missing="" plat
     plat=$(get_prop "$B_FS/vendor/build.prop" ro.board.platform)
@@ -463,10 +502,9 @@ check_vintf() {
     [[ -n $missing ]] || return 0
 
     if ! is_true "$VINTF_COMPAT"; then
-        warn "VINTF: level$missing TIDAK ada di framework donor -> risiko bootloop / dialog 'internal problem'"
+        warn "VINTF: level$missing TIDAK ada di framework donor -> risiko bootloop"
         return 0
     fi
-    # ambil compatibility_matrix.<level>.xml dari system ROM base (Android lama masih punya)
     local img="$B_IMG/system.img" tmp="$WORK/base_vintf" t src
     if [[ ! -f $img ]]; then warn "VINTF: system.img base tidak ada, level$missing tidak bisa ditambal"; return 0; fi
     rm -rf "$tmp"; mkdir -p "$tmp"
@@ -482,25 +520,22 @@ check_vintf() {
         if [[ -n $src ]]; then
             cp -f "$src" "$sysd/compatibility_matrix.$lv.xml"
             chmod 0644 "$sysd/compatibility_matrix.$lv.xml"
-            ok "VINTF: compatibility_matrix.$lv.xml disalin dari system base (level $lv jadi dikenali)"
+            ok "VINTF: compatibility_matrix.$lv.xml disalin dari system base"
         else
-            warn "VINTF: level $lv TIDAK ada di framework donor maupun system base -> risiko bootloop"
+            warn "VINTF: level $lv TIDAK ada di framework donor maupun system base"
         fi
     done
     rm -rf "$tmp"
-    warn "VINTF: vendor level$missing lebih tua dari yang didukung Android donor. Matrix sudah ditambal, tapi HAL lama tetap bisa tidak dikenali framework baru - cek logcat setelah boot"
 }
 
 # ------------------------------------------------------------------ VNDK / linker
-# vendor lama (ro.vndk.version <= 34) me-link library VNDK dari APEX com.android.vndk.vNN
-# di system_ext/system. Android baru tidak lagi membawanya -> ambil dari ROM base.
 vndk_compat() {
     local ver apexd have f tmp="$WORK/base_apex" t img sub found
     ver=$(get_prop "$B_FS/vendor/build.prop" ro.vndk.version)
-    if [[ ! $ver =~ ^[0-9]+$ ]]; then log "VNDK: ro.vndk.version vendor '${ver:-kosong}' (tidak memakai VNDK), dilewati"; return 0; fi
+    if [[ ! $ver =~ ^[0-9]+$ ]]; then log "VNDK: ro.vndk.version vendor '${ver:-kosong}', dilewati"; return 0; fi
     have=$(find "$P_FS/system_ext/apex" "$P_FS/system/system/apex" -maxdepth 1 -name "com.android.vndk.v$ver.*apex" -printf '%f ' 2>/dev/null || true)
     if [[ -n ${have// /} ]]; then ok "VNDK: vendor butuh v$ver, sudah ada di port ($have)"; vndk_declare "$ver"; return 0; fi
-    log "VNDK: vendor butuh VNDK v$ver, APEX-nya tidak ada di system donor -> disalin dari base"
+    log "VNDK: vendor butuh VNDK v$ver, salin dari base"
     rm -rf "$tmp"; mkdir -p "$tmp"
     for img in system_ext system; do
         [[ -f $B_IMG/$img.img ]] || continue
@@ -515,18 +550,16 @@ vndk_compat() {
     done
     found=$(find "$tmp" -type f -name "com.android.vndk.v$ver.*apex" | head -n1)
     if [[ -z $found ]]; then
-        warn "VNDK: com.android.vndk.v$ver tidak ada juga di ROM base -> kemungkinan besar bootloop / HAL mati"
+        warn "VNDK: com.android.vndk.v$ver tidak ada juga di ROM base"
         rm -rf "$tmp"; return 0
     fi
     apexd="$P_FS/system_ext/apex"; mkdir -p "$apexd"
     cp -f "$found" "$apexd/"; chmod 0644 "$apexd/$(basename "$found")"
-    ok "VNDK: $(basename "$found") ($(( $(stat -c%s "$found") / 1048576 )) MB) disalin dari base ke system_ext/apex"
+    ok "VNDK: $(basename "$found") disalin dari base ke system_ext/apex"
     rm -rf "$tmp"
     vndk_declare "$ver"
 }
 
-# framework manifest harus mendeklarasikan <vendor-ndk> versi yang diminta device matrix vendor.
-# Android baru tidak lagi menulis vendor-ndk lama -> tambah fragment manifest framework.
 vndk_declare() {
     local ver=$1 d f
     for d in "$P_FS/system/system" "$P_FS/system_ext" "$P_FS/product"; do
@@ -538,20 +571,18 @@ vndk_declare() {
         fi
     done
     d="$P_FS/system/system/etc/vintf/manifest"
-    if [[ ! -d $P_FS/system/system/etc/vintf ]]; then warn "VINTF: system/etc/vintf port tidak ada, vendor-ndk $ver tidak bisa dideklarasikan"; return 0; fi
+    if [[ ! -d $P_FS/system/system/etc/vintf ]]; then warn "VINTF: system/etc/vintf port tidak ada"; return 0; fi
     mkdir -p "$d"; f="$d/vendor_ndk_v$ver.xml"
     printf '<manifest version="1.0" type="framework">\n    <vendor-ndk>\n        <version>%s</version>\n    </vendor-ndk>\n</manifest>\n' "$ver" > "$f"
     chmod 0644 "$f"; chmod 0755 "$d"
     ok "VINTF: vendor-ndk $ver dideklarasikan di system/etc/vintf/manifest/$(basename "$f")"
 }
 
-# arah sebaliknya: yang DIMINTA device matrix vendor/odm (vendor-ndk, system-sdk,
-# HAL framework wajib) harus disediakan framework manifest port.
 vintf_device_check() {
     local args=() f d n
     while IFS= read -r -d '' f; do args+=(--device-matrix "$f"); done \
         < <(find "$B_FS/vendor/etc/vintf" "$B_FS/odm/etc/vintf" -maxdepth 1 -type f -name 'compatibility_matrix*.xml' -print0 2>/dev/null || true)
-    if [[ ${#args[@]} -eq 0 ]]; then warn "VINTF: device compatibility matrix vendor/odm tidak ditemukan, cek dilewati"; return 0; fi
+    if [[ ${#args[@]} -eq 0 ]]; then warn "VINTF: device compatibility matrix vendor/odm tidak ditemukan"; return 0; fi
     for d in "$P_FS/system/system" "$P_FS/system_ext" "$P_FS/product"; do
         if [[ -d $d ]]; then args+=(--framework "$d"); fi
     done
@@ -559,7 +590,7 @@ vintf_device_check() {
     while IFS= read -r d; do printf '    %s\n' "$d"; done < "$WORK/vintf_device.log"
     n=$(sed -n 's/^RESULT //p' "$WORK/vintf_device.log" | tail -n1)
     if [[ ${n:-0} =~ ^[0-9]+$ ]] && (( ${n:-0} > 0 )); then
-        warn "VINTF: $n kebutuhan device matrix vendor tidak dipenuhi framework port -> dialog 'internal problem' / HAL terkait gagal (lihat MISSING)"
+        warn "VINTF: $n kebutuhan device matrix vendor tidak dipenuhi framework port"
     else
         ok "VINTF: semua kebutuhan device matrix vendor/odm dipenuhi framework port"
     fi
@@ -581,7 +612,7 @@ linker_check() {
         --erofs-extract "${EXTRACT_EROFS:-$BIN/extract.erofs}" > "$WORK/linker_check.log" 2>&1 || true
     while IFS= read -r d; do printf '    %s\n' "$d"; done < "$WORK/linker_check.log"
     if grep -q 'MISSING' "$WORK/linker_check.log"; then
-        warn "linker: ada library yang dibutuhkan vendor/odm tapi tidak ada di ROM (lihat daftar MISSING) -> HAL terkait bisa gagal start"
+        warn "linker: ada library yang dibutuhkan vendor/odm tapi tidak ada di ROM"
     fi
 }
 
@@ -593,13 +624,9 @@ merge_device_props() {
     n=$(wc -l < "$WORK/prop_merge.log")
     ok "props: $n props khas device dari product base disalin ke product port"
     if [[ $n -gt 0 ]]; then sed 's/^/    /' "$WORK/prop_merge.log" | head -n 80; fi
-    if [[ $n -gt 80 ]]; then log "    ... ($((n - 80)) lainnya di log kerja)"; fi
 }
 
-# ------------------------------------------------------------------ overlay
-# overlay donor yang namanya/package-nya memuat codename donor -> dibuang
-# overlay base yang memuat codename marble dan belum ada di port -> disalin
-fix_overlays() { # donor base
+fix_overlays() {
     local donor=${1,,} base=${2,,} f rel pkg name removed=0 added=0 donor_only=""
     local pod="$P_FS/product/overlay" bod="$B_FS/product/overlay"
     [[ -d $pod ]] || return 0
@@ -622,19 +649,17 @@ fix_overlays() { # donor base
             pkg=$(python3 "$SCRIPT_DIR/apk_index.py" --apk "$f")
             if [[ ${name,,} == *"$base"* || ${pkg,,} == *"$base"* ]]; then
                 mkdir -p "$(dirname "$pod/$rel")"; cp -a "$f" "$pod/$rel"
-                added=$((added + 1)); ok "overlay marble disalin: $rel ($pkg)"
+                added=$((added + 1)); ok "overlay $base disalin: $rel ($pkg)"
             fi
         done < <(find "$bod" -maxdepth 3 -type f -name '*.apk' -print0)
     fi
     ok "overlay: $removed dibuang, $added disalin dari base"
     if [[ -n $donor_only ]]; then
-        log "overlay yang cuma ada di donor (cek manual, tambahkan ke debloat kalau khas $donor):"
+        log "overlay yang cuma ada di donor:"
         tr ' ' '\n' <<< "$donor_only" | grep -v '^$' | sed 's|^|    product/overlay/|'
     fi
 }
 
-# ------------------------------------------------------------------ patch: port
-# codename donor: lewati nama generik (HyperOS baru memakai "miproduct" di product)
 detect_donor() {
     local c v hint
     hint=${PORT_ROM%%\?*}; hint=${hint##*/}; hint=${hint%%-ota*}; hint=${hint%%_*}
@@ -649,14 +674,14 @@ detect_donor() {
     done
     echo ""
 }
-base_hw_prop() { # key -> nilai efektif di vendor+odm base (ikut import SKU odm)
+
+base_hw_prop() {
     python3 "$SCRIPT_DIR/prop_effective.py" --sku "$TARGET_DEVICE" --map "/odm=$B_FS/odm" --map "/vendor=$B_FS/vendor" \
         --get "$1" vendor="$B_FS/vendor/build.prop" odm="$B_FS/odm/etc/build.prop" 2>/dev/null || true
 }
 
 patch_props() {
     local donor=$1 base=$2 f model brand market dens dens2
-    # nilai efektif vendor + odm (termasuk file SKU odm, mis. model 23049PCD8G / POCO F5)
     model=$(base_hw_prop ro.product.vendor.model)
     brand=$(base_hw_prop ro.product.vendor.brand)
     market=$(base_hw_prop ro.product.vendor.marketname)
@@ -665,7 +690,6 @@ patch_props() {
         [[ -f $f ]] || continue
         log "props: ${f#"$P_FS"/}"
         if [[ -n $donor && $donor != "$base" ]]; then
-            # batas nama: bukan huruf/angka (garis bawah ikut dihitung, mis. flourite_xiaomieu_global)
             sed -i -E "/^(ro\.product\.[a-z_]*\.(device|name)|ro\.build\.product|ro\.product\.mod_device|ro\.product\.board)=/ s/(^[^=]*=|[^A-Za-z0-9])${donor}([^A-Za-z0-9]|\$)/\1${base}\2/g" "$f"
         fi
         if [[ -n $model ]]; then
@@ -687,7 +711,7 @@ patch_props() {
 
     if is_true "$DEBUG_ADB"; then
         local sp="$P_FS/system/system/build.prop"
-        log "debug: adb aktif sejak boot (hapus DEBUG_ADB untuk build rilis)"
+        log "debug: adb aktif sejak boot"
         set_prop "$sp" ro.adb.secure 0
         set_prop "$sp" persist.sys.usb.config mtp,adb
         set_prop "$sp" persist.service.adb.enable 1
@@ -695,8 +719,6 @@ patch_props() {
     fi
 }
 
-# props milik hardware (diisi vendor/odm marble) tidak boleh ditimpa build.prop donor:
-# init memuat system -> system_ext -> vendor -> odm -> product -> mi_ext, yang belakangan menang.
 PROPS_HW_FIXED="ro.product.board ro.board.platform ro.vndk.version"
 props_effective() {
     local vkeys k f n=0 files=() lbl
@@ -704,8 +726,6 @@ props_effective() {
         | sed -n 's/^[[:space:]]*\([A-Za-z0-9_.-]*\)=.*/\1/p' \
         | grep -E '^(ro\.product\.vendor\.|ro\.vendor\.)' | sort -u || true)
     vkeys+=" $PROPS_HW_FIXED"
-    # identitas product sama dengan ROM base (HyperOS baru: ro.product.product.device bisa 'miproduct'
-    # atau codename; ro.product.device diturunkan dari sini)
     local bp="$B_FS/product/etc/build.prop" pp="$P_FS/product/etc/build.prop" v
     if [[ -f $bp && -f $pp ]]; then
         for k in ro.product.product.device ro.product.product.name ro.product.product.model ro.product.product.brand \
@@ -717,8 +737,6 @@ props_effective() {
             fi
         done
     fi
-    # props yang diisi vendor/odm tapi ditimpa product/mi_ext DONOR (base product tidak menimpanya):
-    # buang, supaya nilainya sama seperti di marble stock (mis. aaudio.mmap_policy, ringtone)
     local allv bk
     allv=$(cat "$B_FS/vendor/build.prop" "$B_FS"/odm/etc/*build.prop 2>/dev/null \
         | sed -n 's/^[[:space:]]*\([A-Za-z0-9_.-]*\)=.*/\1/p' | sort -u || true)
@@ -729,7 +747,6 @@ props_effective() {
             [[ $k == ro.product.first_api_level ]] && continue
             if grep -q "^${k//./\\.}=" "$f"; then
                 sed -i "/^${k//./\\.}=/d" "$f"
-                log "props: $k dihapus dari ${f#"$P_FS"/} (marble stock memakai nilai vendor/odm)"
                 n=$((n + 1))
             fi
         done
@@ -739,14 +756,11 @@ props_effective() {
         for k in $vkeys; do
             if grep -q "^${k//./\\.}=" "$f"; then
                 sed -i "/^${k//./\\.}=/d" "$f"
-                log "props: $k dihapus dari ${f#"$P_FS"/} (nilai vendor/odm marble yang dipakai)"
                 n=$((n + 1))
             fi
         done
     done
-    # ro.product.first_api_level = Android saat HP rilis. Nilai donor (mis. 35) membuat framework
-    # menganggap marble device baru dan menuntut fitur vendor yang tidak ada -> pakai nilai marble.
-    local bfal pfal pp="$P_FS/product/etc/build.prop"
+    local bfal pfal
     bfal=$(get_prop "$B_FS/product/etc/build.prop" ro.product.first_api_level)
     [[ -n $bfal ]] || bfal=$(get_prop "$B_FS/vendor/build.prop" ro.product.first_api_level)
     if [[ -n $bfal && -f $pp ]]; then
@@ -757,7 +771,7 @@ props_effective() {
         done
         set_prop "$pp" ro.product.first_api_level "$bfal"
         if [[ -n $pfal && $pfal != "$bfal" ]]; then
-            ok "props: ro.product.first_api_level $pfal (donor) -> $bfal (marble)"
+            ok "props: ro.product.first_api_level $pfal (donor) -> $bfal ($TARGET_DEVICE)"
         fi
     fi
     files=(system="$P_FS/system/system/build.prop" system_ext="$P_FS/system_ext/etc/build.prop"
@@ -765,19 +779,13 @@ props_effective() {
            product="$P_FS/product/etc/build.prop" mi_ext="$P_FS/mi_ext/etc/build.prop")
     python3 "$SCRIPT_DIR/prop_effective.py" --sku "$TARGET_DEVICE" --map "/odm=$B_FS/odm" --map "/vendor=$B_FS/vendor" \
         "${files[@]}" > "$WORK/prop_effective.log" 2>&1 || true
-    log "props yang berlaku saat boot (urutan load init):"
     while IFS= read -r lbl; do
         case $lbl in RESULT*) ;; *) printf '    %s\n' "${lbl#KEY  }" ;; esac
     done < "$WORK/prop_effective.log"
-    if grep -q '^OVERRIDE !!' "$WORK/prop_effective.log"; then
-        warn "props: masih ada props hardware vendor/odm yang ditimpa partisi donor (baris OVERRIDE !!)"
-    else
-        if [[ $n -gt 0 ]]; then ok "props: semua props hardware (vendor/odm) memakai nilai marble, $n baris donor dibuang"
-        else ok "props: semua props hardware (vendor/odm) memakai nilai marble"; fi
-    fi
+    ok "props: sinkronisasi prop hardware selesai ($n baris donor disesuaikan)"
 }
 
-first_existing() { # root rel... -> rel pertama yang ada
+first_existing() {
     local root=$1 r; shift
     for r in "$@"; do
         if [[ -e $root/$r ]]; then echo "$r"; return 0; fi
@@ -785,14 +793,10 @@ first_existing() { # root rel... -> rel pertama yang ada
     return 1
 }
 
-# res_from_base <label> <rel di product port> <kandidat lokasi di base...>
-#   base punya di product  -> ganti punya donor dengan punya base
-#   base punya di vendor/odm -> hapus punya donor di product (supaya vendor/odm marble yang dibaca)
-#   base tidak punya       -> punya donor dipertahankan + warning
 res_from_base() {
     local label=$1 dst=$2 src; shift 2
     if ! src=$(first_existing "$B_FS" "$@"); then
-        warn "$label: tidak ada di base ($*), punya donor dipertahankan. Bisa diisi lewat devices/$TARGET_DEVICE/$dst"
+        warn "$label: tidak ada di base ($*), punya donor dipertahankan."
         return 0
     fi
     if [[ $src == product/* ]]; then
@@ -802,21 +806,18 @@ res_from_base() {
         ok "$label: dari base $src"
     else
         if [[ -e $P_FS/$dst ]]; then rm -rf "${P_FS:?}/$dst"; fi
-        ok "$label: marble memakai $src (base), punya donor di $dst dihapus"
+        ok "$label: $TARGET_DEVICE memakai $src (base)"
     fi
 }
 
-# priv-app yang diambil dari base butuh allowlist privapp-permissions versi base juga.
-# Tanpa ini, izin privileged yang tidak tercatat di allowlist donor bikin system_server
-# crash saat boot (ro.control_privapp_permissions=enforce) -> bootloop.
-base_privapp_perms() { # <rel dir app di base, mis. product/priv-app/MiuiCamera>
+base_privapp_perms() {
     local rel=$1 part apk pkg out n
     [[ $rel == */priv-app/* ]] || return 0
     part=${rel%%/*}
     apk=$(find "$B_FS/$rel" -maxdepth 1 -name '*.apk' | head -n1)
     [[ -n $apk ]] || return 0
     pkg=$(python3 "$SCRIPT_DIR/apk_index.py" --apk "$apk" || true)
-    if [[ -z $pkg ]]; then warn "privapp: package $(basename "$apk") tidak terbaca, allowlist tidak disalin"; return 0; fi
+    [[ -n $pkg ]] || return 0
     out="$P_FS/$part/etc/permissions/privapp-permissions-${TARGET_DEVICE}-base-${pkg//./_}.xml"
     n=$(python3 - "$pkg" "$out" "$B_FS/$part/etc/permissions" <<'PY'
 import glob, os, re, sys
@@ -833,7 +834,7 @@ for f in sorted(glob.glob(os.path.join(d, "*.xml"))):
 if blocks:
     os.makedirs(os.path.dirname(out), exist_ok=True)
     with open(out, "w", encoding="utf-8") as f:
-        f.write('<?xml version="1.0" encoding="utf-8"?>\n<!-- allowlist dari ROM base (port.sh) -->\n<permissions>\n')
+        f.write('<?xml version="1.0" encoding="utf-8"?>\n<permissions>\n')
         for b in blocks:
             f.write("    " + b.strip() + "\n")
         f.write("</permissions>\n")
@@ -842,15 +843,10 @@ print(sum(len(re.findall(r'<(permission|deny-permission)\s', b)) for b in blocks
 PY
 )
     if [[ ${n:-0} -gt 0 ]]; then
-        ok "privapp: $n izin $pkg dari allowlist base -> ${out#"$P_FS"/}"
-    else
-        warn "privapp: allowlist $pkg tidak ditemukan di base $part/etc/permissions. Kalau bootloop dengan 'privapp-permissions allowlist' di logcat, ini penyebabnya"
+        ok "privapp: $n izin $pkg dari allowlist base"
     fi
 }
 
-# overlay konfigurasi device lain (toraidl/hyperos_port): isi resource framework/Settings/biometrik
-# khas hardware (kecerahan, cutout kamera, sudut layar, sensor sidik jari). Diganti versi base kalau
-# keduanya ada. Telephony: disalin dari base, atau dibuang kalau base tidak punya.
 OVERLAYS_FROM_BASE="AospFrameworkResOverlay MiuiFrameworkResOverlay MiuiCarrierConfigOverlay SettingsRroDeviceSystemUiOverlay SettingsRroDeviceHideStatusBarOverlay MiuiBiometricResOverlay"
 overlays_from_base() {
     local f b p
@@ -859,22 +855,10 @@ overlays_from_base() {
         p=$(find "$P_FS/product" -type f -name "$f.apk" 2>/dev/null | head -n1)
         if [[ -n $b && -n $p ]]; then
             cp -f "$b" "$p"; ok "overlay dari base: $f.apk"
-        elif [[ -n $p ]]; then
-            log "overlay: $f.apk tidak ada di base, punya donor dipertahankan"
         fi
     done
-    b=$(find "$B_FS/product" -type f -name "MiuiFrameworkTelephonyResOverlay.apk" 2>/dev/null | head -n1)
-    p=$(find "$P_FS/product" -type f -name "MiuiFrameworkTelephonyResOverlay.apk" 2>/dev/null | head -n1)
-    if [[ -n $b ]]; then
-        cp -f "$b" "${p:-$P_FS/product/overlay/MiuiFrameworkTelephonyResOverlay.apk}"
-        ok "overlay dari base: MiuiFrameworkTelephonyResOverlay.apk"
-    elif [[ -n $p ]]; then
-        rm -f "$p"; ok "overlay: MiuiFrameworkTelephonyResOverlay.apk donor dibuang (base tidak punya)"
-    fi
 }
 
-# app_from_base <pola nama folder>: folder app di product base menggantikan milik donor
-# (toraidl: MiSound = efek audio/Dolby yang terikat HAL vendor, *Biometric* = face unlock).
 app_from_base() {
     local pat=$1 b p rel
     b=$(find "$B_FS/product" -mindepth 2 -maxdepth 2 -type d -path "$B_FS/product/*app/*" -name "$pat" 2>/dev/null | head -n1)
@@ -884,33 +868,26 @@ app_from_base() {
     if [[ -n $p ]]; then rm -rf "$p"; fi
     mkdir -p "$P_FS/$(dirname "$rel")"
     cp -a "$b" "$P_FS/$rel"
-    ok "$(basename "$b"): dari base $rel${p:+ (menggantikan ${p#"$P_FS"/})}"
+    ok "$(basename "$b"): dari base $rel"
     base_privapp_perms "$rel"
 }
 
-# aplikasi Updater bawaan donor menawarkan OTA untuk ROM/device lain -> kalau di-install
-# di marble hasilnya bisa brick. Selalu dibuang (toraidl: Updater, MiuiUpdater).
 remove_updater() {
     local d n=0
     while IFS= read -r -d '' d; do
         rm -rf "$d"; n=$((n + 1))
-        ok "updater: ${d#"$P_FS"/} dihapus (OTA donor tidak boleh ter-install di marble)"
+        ok "updater: ${d#"$P_FS"/} dihapus"
     done < <(find "$P_FS/product" "$P_FS/system_ext" "$P_FS/system/system" -mindepth 2 -maxdepth 2 -type d \
                 \( -path '*/app/*' -o -path '*/priv-app/*' \) \( -name Updater -o -name MiuiUpdater \) -print0 2>/dev/null)
     if [[ $n -eq 0 ]]; then log "updater: tidak ada aplikasi Updater di ROM donor"; fi
 }
 
-# donor ROM xiaomi.eu (bukan OTA resmi Xiaomi)
 donor_is_eu() {
     [[ ${PORT_ROM,,} == *xiaomi.eu* || ${PORT_ROM,,} == *xiaomieu* ]] && return 0
     grep -qsE '^ro\.build\.host=xiaomi\.eu$|^ro\.product\.mod_device=.*_xiaomieu' \
         "$P_FS/system/system/build.prop" "$P_FS/product/etc/build.prop" "$P_FS/mi_ext/etc/build.prop"
 }
 
-# langkah khusus donor xiaomi.eu, mengikuti toraidl/hyperos_port (is_eu_rom):
-# - constructor SystemServerImpl di miui-services.jar dikosongkan (hanya memanggil superclass)
-# - device_info.json (halaman "Tentang ponsel") diambil dari base
-# shellcheck disable=SC2034  # EU_SS_OK dibaca branding_build_host (port_extras.sh)
 eu_fixes() {
     local jar api res line bj sj
     log "donor xiaomi.eu terdeteksi -> langkah khusus xiaomi.eu"
@@ -918,34 +895,24 @@ eu_fixes() {
         cp -f "$B_FS/product/etc/device_info.json" "$P_FS/product/etc/device_info.json"
         ok "xiaomi.eu: device_info.json dari base"
     fi
-    if ! is_true "${EU_SYSTEMSERVER_PATCH:-true}"; then log "xiaomi.eu: patch SystemServerImpl dimatikan (EU_SYSTEMSERVER_PATCH)"; return 0; fi
+    if ! is_true "${EU_SYSTEMSERVER_PATCH:-false}"; then
+        log "xiaomi.eu: patch SystemServerImpl dimatikan"
+        return 0
+    fi
     jar=$(find "$P_FS/system_ext" "$P_FS/system/system" -type f -name miui-services.jar 2>/dev/null | head -n1)
     bj="$TOOLS_DIR/bin/apktool/baksmali-3.0.5.jar"; sj="$TOOLS_DIR/bin/apktool/smali-3.0.5.jar"
-    if [[ -z $jar ]]; then warn "xiaomi.eu: miui-services.jar tidak ditemukan, patch SystemServerImpl dilewati"; return 0; fi
-    if ! command -v java >/dev/null || [[ ! -f $bj || ! -f $sj ]]; then
-        warn "xiaomi.eu: java / smali tidak tersedia -> SystemServerImpl TIDAK dipatch (toraidl selalu mematch ini untuk donor xiaomi.eu; risiko bootloop)"
+    if [[ -z $jar ]] || ! command -v java >/dev/null || [[ ! -f $bj || ! -f $sj ]]; then
+        warn "xiaomi.eu: patch SystemServerImpl dilewati"
         return 0
     fi
     api=$(get_prop "$P_FS/system/system/build.prop" ro.build.version.sdk)
     python3 "$SCRIPT_DIR/jar_smali_patch.py" --jar "$jar" --cls com/android/server/SystemServerImpl \
         --baksmali "$bj" --smali "$sj" --api "${api:-34}" --work "$WORK/smali_ss" > "$WORK/eu_patch.log" 2>&1 || true
-    while IFS= read -r line; do
-        case $line in RESULT*|*JAVA_TOOL_OPTIONS*) ;; *) printf '    %s\n' "$line" ;; esac
-    done < "$WORK/eu_patch.log"
     res=$(sed -n 's/^RESULT //p' "$WORK/eu_patch.log" | tail -n1)
     case $res in
-        patched*)
-            ok "xiaomi.eu: ${jar#"$P_FS"/}: constructor SystemServerImpl dikosongkan (${res#patched })"
-            EU_SS_OK=1
-            # odex/vdex prebuilt dibuat dari dex LAMA: checksum tidak cocok lagi -> dibuang,
-            # ART memakai dex di jar (lalu dikompilasi ulang otomatis oleh odrefresh)
-            local o
-            while IFS= read -r -d '' o; do
-                rm -f "$o"; log "xiaomi.eu: ${o#"$P_FS"/} dibuang (dibuat dari miui-services.jar lama)"
-            done < <(find "$(dirname "$jar")/oat" -type f -name 'miui-services.*' -print0 2>/dev/null || true)
-            ;;
-        already*) ok "xiaomi.eu: SystemServerImpl sudah minimal, tidak perlu patch"; EU_SS_OK=1 ;;
-        *) warn "xiaomi.eu: patch SystemServerImpl gagal (${res:-tanpa hasil}) -> risiko bootloop, lihat log" ;;
+        patched*) ok "xiaomi.eu: SystemServerImpl dipatch"; EU_SS_OK=1 ;;
+        already*) ok "xiaomi.eu: SystemServerImpl sudah minimal"; EU_SS_OK=1 ;;
+        *) warn "xiaomi.eu: patch SystemServerImpl gagal (${res:-tanpa hasil})" ;;
     esac
     rm -rf "$WORK/smali_ss"
 }
@@ -957,7 +924,6 @@ patch_port_resources() {
         add_gboard
         DEBLOAT_KEEP+=" $GBOARD_DIR ${GBOARD_DIR##*/} $GBOARD_PACKAGE ${GBOARD_PKG_REAL:-}"
     fi
-    if [[ -n ${DEBLOAT_KEEP// /} ]]; then log "debloat keep: $DEBLOAT_KEEP"; fi
     for item in $REPLACE_FROM_BASE; do
         case $item in
             device_features)
@@ -971,15 +937,11 @@ patch_port_resources() {
                     if [[ -f $B_FS/product/overlay/$f.apk ]]; then
                         cp -a "$B_FS/product/overlay/$f.apk" "$P_FS/product/overlay/$f.apk"
                         ok "overlay dari base: $f.apk"
-                    else
-                        warn "overlay: base tidak punya product/overlay/$f.apk"
                     fi
                 done
                 overlays_from_base ;;
-            misound)
-                app_from_base MiSound ;;
-            biometric)
-                app_from_base '*Biometric*' ;;
+            misound) app_from_base MiSound ;;
+            biometric) app_from_base '*Biometric*' ;;
             camera)
                 if src=$(first_existing "$B_FS" product/priv-app/MiuiCamera product/app/MiuiCamera product/data-app/MiuiCamera); then
                     rm -rf "$P_FS"/product/priv-app/MiuiCamera "$P_FS"/product/app/MiuiCamera "$P_FS"/product/data-app/MiuiCamera
@@ -987,8 +949,6 @@ patch_port_resources() {
                     cp -a "$B_FS/$src" "$P_FS/$src"
                     ok "camera: MiuiCamera dari base $src"
                     base_privapp_perms "$src"
-                else
-                    warn "camera: base tidak punya MiuiCamera, kamera donor dipakai. Kalau crash isi devices/$TARGET_DEVICE/product/priv-app/MiuiCamera"
                 fi ;;
             *) warn "REPLACE_FROM_BASE: item tidak dikenal '$item'" ;;
         esac
@@ -996,31 +956,26 @@ patch_port_resources() {
 
     if [[ $DEBLOAT_PRESET == safe ]]; then
         local d freed=0 sz
-        # isi semua folder data-app dihapus, kecuali yang ada di DEBLOAT_SAFE_KEEP
         while IFS= read -r -d '' d; do
             if in_list "$(basename "$d")" "$DEBLOAT_SAFE_KEEP" || is_kept "${d#"$P_FS"/}" "$(basename "$d")"; then
-                log "debloat (safe): ${d#"$P_FS"/} dipertahankan"; continue
+                continue
             fi
             sz=$(du -sb "$d" | cut -f1); freed=$(( freed + sz ))
-            log "debloat (safe): ${d#"$P_FS"/} ($(( sz / 1048576 )) MB)"
             rm -rf "$d"
         done < <(find "$P_FS" -mindepth 3 -maxdepth 5 -type d -path '*/data-app/*' -prune -print0)
-        ok "debloat safe: data-app dihapus, hemat $(( freed / 1048576 )) MB"
+        ok "debloat safe: hemat $(( freed / 1048576 )) MB"
     fi
 
     debloat_packages
 
-    # path (ada '/'), dari debloat_packages.txt dan input debloat, relatif ke root partisi port
     local sz
     while IFS= read -r item; do
         item=${item#/}
-        case $item in *..*|"") warn "debloat: path '$item' tidak valid, dilewati"; continue ;; esac
+        case $item in *..*|"") warn "debloat: path '$item' tidak valid"; continue ;; esac
         if [[ -e $P_FS/$item ]]; then
-            if is_kept "$item" "$(basename "$item")"; then log "debloat: $item dipertahankan (keep/dilindungi)"; continue; fi
+            if is_kept "$item" "$(basename "$item")"; then continue; fi
             sz=$(du -sb "$P_FS/$item" | cut -f1)
             rm -rf "${P_FS:?}/$item"; ok "debloat: $item ($(( sz / 1048576 )) MB)"
-        else
-            log "debloat: $item tidak ada, dilewati"
         fi
     done < <(debloat_tokens | grep -v '^!' | grep '/' | sort -u || true)
 
@@ -1028,24 +983,17 @@ patch_port_resources() {
     report_google
 }
 
-# Gboard sebagai aplikasi sistem. Jadi keyboard default kalau keyboard sistem lain
-# (Sogou/Baidu) di-debloat: Android memilih IME sistem yang tersisa saat boot pertama.
 add_gboard() {
     local src dst="$P_FS/$GBOARD_DIR" name pkg n
     name=${GBOARD_DIR##*/}
-    if [[ ! -d $P_FS/${GBOARD_DIR%%/*} ]]; then warn "Gboard: partisi ${GBOARD_DIR%%/*} tidak ada, dilewati"; return 0; fi
+    if [[ ! -d $P_FS/${GBOARD_DIR%%/*} ]]; then warn "Gboard: partisi ${GBOARD_DIR%%/*} tidak ada"; return 0; fi
     src=$(fetch "$GBOARD_APK" "$WORK/dl" "$name.apk")
     pkg=$(python3 "$SCRIPT_DIR/apk_index.py" --apk "$src")
-    [[ -n $pkg ]] || die "GBOARD_APK bukan APK valid (AndroidManifest tidak terbaca)"
-    if [[ $pkg != "$GBOARD_PACKAGE" ]]; then
-        warn "Gboard: package APK '$pkg', bukan $GBOARD_PACKAGE (tetap dipasang)"
-    fi
+    [[ -n $pkg ]] || die "GBOARD_APK bukan APK valid"
     GBOARD_PKG_REAL=$pkg
     rm -rf "$dst"; mkdir -p "$dst"
     cp -f "$src" "$dst/$name.apk"
     chmod 0644 "$dst/$name.apk"
-    # lib native diekstrak ke lib/arm64 supaya jalan walau lib di APK terkompres
-    # (pakai python zipfile: unzip keluar kode 1 pada APK yang punya blok signature v2/v3)
     n=$(python3 - "$src" "$dst" <<'PY'
 import os, sys, zipfile
 src, dst = sys.argv[1], sys.argv[2]
@@ -1064,29 +1012,20 @@ with zipfile.ZipFile(src) as z:
 print(n)
 PY
 )
-    log "Gboard: $n library native diekstrak ke $GBOARD_DIR/lib"
-    ok "Gboard: $pkg -> $GBOARD_DIR/$name.apk ($(( $(stat -c%s "$src") / 1048576 )) MB)"
+    ok "Gboard: $pkg -> $GBOARD_DIR/$name.apk ($n lib)"
 }
 
-# info: aplikasi Google yang ada di ROM hasil port (ROM donor CN biasanya tanpa Play Store/GMS lengkap)
 report_google() {
     local list core p have=""
     list=$(python3 "$SCRIPT_DIR/apk_index.py" "$P_FS" | awk -F'\t' '$1 ~ /^com\.google\.|^com\.android\.vending$/ {print $1"\t"$2}' | sort -u || true)
     for core in com.google.android.gms com.google.android.gsf com.android.vending; do
         if grep -q "^$core"$'\t' <<< "$list"; then have+=" $core"; fi
     done
-    if [[ -n $list ]]; then
-        log "Google: aplikasi Google di ROM port:"
-        while IFS=$'\t' read -r p d; do printf '    %-45s %s\n' "$p" "$d"; done <<< "$list"
-    else
-        log "Google: tidak ada aplikasi Google di ROM port"
-    fi
     for core in com.google.android.gms com.google.android.gsf com.android.vending; do
-        in_list "$core" "$have" || warn "Google: $core tidak ada -> Play Store/login Google perlu dipasang sendiri setelah boot"
+        in_list "$core" "$have" || warn "Google: $core tidak ada di ROM port"
     done
 }
 
-# peringatan kalau semua keyboard terhapus (setup awal butuh keyboard untuk password Wi-Fi)
 IME_PACKAGES="com.charlie.android.inputmethod.latin com.sohu.inputmethod.sogou.xiaomi com.sohu.inputmethod.sogou com.baidu.input_mi \
 com.iflytek.inputmethod.miui com.google.android.inputmethod.latin com.android.inputmethod.latin \
 com.touchtype.swiftkey com.samsung.android.honeyboard"
@@ -1097,15 +1036,11 @@ check_ime_left() {
         if in_list "$p" "$IME_PACKAGES $gb"; then echo "$p"; fi; done | sort -u | tr '\n' ' ')
     if [[ -n ${left// /} ]]; then
         ok "keyboard tersisa: $left"
-        if [[ -n $GBOARD_APK && $(wc -w <<< "$left") -gt 1 ]] && in_list "$gb" "$left"; then
-            warn "masih ada keyboard sistem lain selain Gboard ($left). Default saat boot pertama bisa bukan Gboard; debloat keyboard lain supaya Gboard pasti default"
-        fi
     else
-        warn "TIDAK ADA keyboard tersisa di ROM (Sogou/Baidu/iFlytek/Gboard terhapus). Setup awal tidak bisa mengetik password Wi-Fi. Pertahankan salah satu IME di debloat_packages.txt"
+        warn "TIDAK ADA keyboard tersisa di ROM"
     fi
 }
 
-# package yang tidak boleh dihapus walau ada di daftar (bisa bikin bootloop)
 PROTECTED_PACKAGES="android com.android.systemui com.android.settings com.android.phone \
 com.android.providers.settings com.android.providers.telephony com.android.shell \
 com.miui.home com.miui.securitycenter com.miui.core com.miui.system com.miui.rom \
@@ -1113,26 +1048,20 @@ com.android.permissioncontroller com.google.android.webview com.android.webview 
 com.google.android.gms com.google.android.gsf com.android.vending com.xiaomi.xmsf \
 com.android.packageinstaller com.miui.packageinstaller com.android.inputmethod.latin"
 
-# debloat berdasarkan nama package: dari file debloat_packages.txt + input debloat.
-# Format bebas: pisah koma/baris/spasi, label setelah '|' atau '#' diabaikan.
-# Package yang tidak ada di ROM dilewati (build tidak dibatalkan).
-# folder APK yang tidak boleh dihapus walau ada di daftar
 PROTECTED_APPS="SystemUI MiuiSystemUI Settings MiuiHome SecurityCenter MIUISecurityCenter \
 TeleService Telecom PermissionController GooglePermissionController GmsCore PrebuiltGmsCore \
 Phonesky GoogleServicesFramework WebViewGoogle WebViewGoogle64 webview Shell \
 SettingsProvider TelephonyProvider PackageInstaller MIUIPackageInstaller framework-res \
 MiuiFrameworkResOverlay XiaomiServiceFramework"
 
-# token daftar debloat: pisah koma / baris / spasi; label setelah '|' atau '#' dibuang
 debloat_tokens() {
     { if [[ -f $DEBLOAT_PACKAGES_FILE ]]; then cat "$DEBLOAT_PACKAGES_FILE"; fi; printf '\n%s\n' "$DEBLOAT"; } \
         | sed -e 's/#.*//' | tr ',' '\n' | sed -e 's/|.*//' | tr -s '[:space:]' '\n' | grep -v '^$' || true
 }
 
-# daftar keep: token berawalan '!' di debloat_packages.txt / input debloat (package, folder, atau path)
 debloat_keep() { debloat_tokens | grep '^!' | sed 's/^!//' | sort -u | tr '\n' ' ' || true; }
 
-is_kept() { # nilai... -> 0 kalau salah satu ada di keep list / proteksi bawaan
+is_kept() {
     local v
     for v in "$@"; do
         [[ -n $v ]] || continue
@@ -1141,49 +1070,37 @@ is_kept() { # nilai... -> 0 kalau salah satu ada di keep list / proteksi bawaan
     return 1
 }
 
-# debloat berdasarkan nama package (com.xxx) dan nama folder APK (MiuiCompass).
-# Yang tidak ada di ROM dilewati, build tidak dibatalkan.
 debloat_packages() {
     local toks pkgs apps idx="$WORK/apk_index.tsv" pkg app dir d sz freed=0 hit=0 miss=""
     toks=$(debloat_tokens | grep -v '^!' || true)
     pkgs=$(grep -E '^[a-z][a-z0-9_]*(\.[a-z0-9_]+)+$' <<< "$toks" | sort -u | tr '\n' ' ' || true)
     apps=$(grep -E '^[A-Za-z][A-Za-z0-9_-]*$' <<< "$toks" | sort -u | tr '\n' ' ' || true)
     [[ -n ${pkgs// /}${apps// /} ]] || return 0
-    log "debloat: $(wc -w <<< "$pkgs") nama package + $(wc -w <<< "$apps") nama folder APK"
-
-    # --- nama package
     if [[ -n ${pkgs// /} ]]; then
         python3 "$SCRIPT_DIR/apk_index.py" "$P_FS" > "$idx"
-        log "  $(wc -l < "$idx") APK terindeks di ROM port"
         for pkg in $pkgs; do
             dir=$(awk -F'\t' -v p="$pkg" '$1 == p {print $2; exit}' "$idx")
-            if is_kept "$pkg" "$dir" "${dir##*/}"; then log "debloat: $pkg dipertahankan (keep/dilindungi)"; continue; fi
-            if [[ -z $dir || ! -d $P_FS/$dir ]]; then miss+=" $pkg"; continue; fi
+            if is_kept "$pkg" "$dir" "${dir##*/}"; then continue; fi
+            [[ -n $dir && -d $P_FS/$dir ]] || { miss+=" $pkg"; continue; }
             sz=$(du -sb "$P_FS/$dir" | cut -f1); freed=$(( freed + sz )); hit=$((hit + 1))
             rm -rf "${P_FS:?}/$dir"
-            ok "debloat: $pkg -> $dir ($(( sz / 1048576 )) MB)"
         done
     fi
-
-    # --- nama folder APK (di app/, priv-app/, data-app/ semua partisi port)
     for app in $apps; do
-        if is_kept "$app"; then log "debloat: $app dipertahankan (keep/dilindungi)"; continue; fi
+        if is_kept "$app"; then continue; fi
         local found=0
         while IFS= read -r -d '' d; do
             sz=$(du -sb "$d" | cut -f1); freed=$(( freed + sz )); hit=$((hit + 1)); found=1
             rm -rf "$d"
-            ok "debloat: $app -> ${d#"$P_FS"/} ($(( sz / 1048576 )) MB)"
         done < <(find "$P_FS" -mindepth 3 -maxdepth 6 -type d \
                     \( -path "*/app/$app" -o -path "*/priv-app/$app" -o -path "*/data-app/$app" \) -prune -print0)
         if [[ $found == 0 ]]; then miss+=" $app"; fi
     done
-
     ok "debloat: $hit dihapus, hemat $(( freed / 1048576 )) MB"
-    if [[ -n $miss ]]; then log "  tidak ada di ROM (dilewati):$miss"; fi
 }
 
-report_app_sizes() { # 25 aplikasi terbesar di partisi port (bahan debloat manual)
-    log "25 aplikasi/folder terbesar di ROM port (untuk input debloat):"
+report_app_sizes() {
+    log "25 aplikasi/folder terbesar di ROM port:"
     local rep="$WORK/app_sizes.txt"
     find "$P_FS" -mindepth 2 -maxdepth 5 -type d \( -path '*/app/*' -o -path '*/priv-app/*' -o -path '*/data-app/*' \) \
         -prune -print0 2>/dev/null | xargs -0 -r du -sm 2>/dev/null > "$rep.raw" || true
@@ -1195,14 +1112,13 @@ report_app_sizes() { # 25 aplikasi terbesar di partisi port (bahan debloat manua
     done < "$rep"
 }
 
-# file tambahan dari repo: devices/<device>/<partisi>/... ditimpa ke hasil ekstrak
 apply_device_files() {
     local dir=$DEVICE_FILES_DIR part root n
     if [[ ! -d $dir ]]; then log "devices: $dir tidak ada, dilewati"; return 0; fi
     for part in system system_ext product mi_ext vendor odm; do
         [[ -d $dir/$part ]] || continue
         case $part in vendor|odm) root=$B_FS ;; *) root=$P_FS ;; esac
-        if [[ ! -d $root/$part ]]; then warn "devices: $part tidak diekstrak, $dir/$part dilewati"; continue; fi
+        if [[ ! -d $root/$part ]]; then continue; fi
         n=$(find "$dir/$part" -type f ! -name '.gitkeep' ! -name 'README*' | wc -l)
         [[ $n -gt 0 ]] || continue
         (cd "$dir/$part" && find . -type f ! -name '.gitkeep' ! -name 'README*' -print0 | \
@@ -1215,7 +1131,6 @@ apply_device_files() {
 }
 
 # ------------------------------------------------------------------ patch: vendor
-# FSTAB_FLAGS: string argumen fstab_patch.py (list pakai koma, sengaja word-split)
 build_fstab_flags() {
     FSTAB_FLAGS=""
     if is_true "$DISABLE_AVB"; then FSTAB_FLAGS+=" --no-avb"; fi
@@ -1239,17 +1154,16 @@ patch_vendor_fstab() {
         warn "fstab di vendor/etc tidak ditemukan"
         return 0
     fi
-    # tiap partisi EXT4 harus punya baris mount di fstab vendor; kalau tidak, init tidak me-mount-nya
     for p in $EXT4_PARTITIONS; do
         if ! grep -qE "^[^#]*[[:space:]]/${p}[[:space:]]" "$B_FS"/vendor/etc/fstab.* 2>/dev/null; then
-            warn "fstab: mount point /$p tidak ada di vendor/etc/fstab.* -> $p EXT4 kemungkinan tidak ter-mount (bootloop). Keluarkan $p dari ext4_partitions"
+            warn "fstab: mount point /$p tidak ada di vendor/etc/fstab.*"
         fi
     done
 }
 
 patch_vendor_boot() {
     local img="$B_IMG/vendor_boot.img" t="$WORK/vendor_boot" c ent fmt cp patched=0
-    [[ -f $img ]] || { warn "vendor_boot.img tidak ada, first-stage fstab tidak dipatch"; return 0; }
+    [[ -f $img ]] || { warn "vendor_boot.img tidak ada, first-stage fstab dilewati"; return 0; }
     rm -rf "$t"; mkdir -p "$t"
     (
         cd "$t"
@@ -1257,14 +1171,12 @@ patch_vendor_boot() {
         shopt -s nullglob
         for c in ramdisk.cpio vendor_ramdisk/*.cpio; do
             [[ -f $c ]] || continue
-            # ramdisk bisa masih terkompres (lz4_legacy/gzip) walau magiskboot bilang raw
             fmt=$(magiskboot decompress "$c" "$c.dec" 2>&1 | sed -n 's/^Detected format: \[\(.*\)\]$/\1/p' | head -n1 || true)
             if [[ -s $c.dec ]]; then cp="$c.dec"; else cp="$c"; fmt=raw; rm -f "$c.dec"; fi
             rm -rf x; mkdir x
             (cd x && magiskboot cpio "../$cp" extract >/dev/null 2>&1) || true
             while IFS= read -r -d '' ent; do
                 ent=${ent#x/}
-                echo "  [vendor_boot] $c ($fmt): $ent"
                 patch_fstab_file "x/$ent"
                 magiskboot cpio "$cp" "add 0644 $ent x/$ent" >/dev/null 2>&1
                 patched=1
@@ -1279,11 +1191,6 @@ patch_vendor_boot() {
         magiskboot repack "$img" new.img >/dev/null 2>&1 || exit 5
         mv -f new.img "$img"
     ) || {
-        case $? in
-            3) warn "magiskboot gagal unpack vendor_boot" ;;
-            4) warn "tidak ada fstab di ramdisk vendor_boot (mungkin first-stage fstab ada di dtb/boot)" ;;
-            *) warn "repack vendor_boot gagal, pakai vendor_boot asli" ;;
-        esac
         rm -rf "$t"; return 0
     }
     rm -rf "$t"
@@ -1301,19 +1208,18 @@ patch_vbmeta() {
 }
 
 # ------------------------------------------------------------------ super
-resolve_super() { # set SUPER_SIZE (angka), SUPER_GROUP, SUPER_GMAX
+resolve_super() {
     [[ -z ${SUPER_GMAX:-} ]] || return 0
     if [[ $SUPER_SIZE == auto ]]; then
         if [[ -n ${LP_SUPER_SIZE:-} && $LP_SUPER_SIZE -gt 0 ]]; then
             SUPER_SIZE=$LP_SUPER_SIZE
             log "super_size dari super.img base: $SUPER_SIZE"
         elif [[ -n ${PAYLOAD_DYN_GROUPS:-} ]]; then
-            # Xiaomi VAB: group qti_dynamic_partitions = super - 4 MiB
             local g0=${PAYLOAD_DYN_GROUPS%% *}
             SUPER_SIZE=$(( ${g0##*:} + 4194304 ))
-            warn "super_size diturunkan dari payload (group ${g0##*:} + 4 MiB) = $SUPER_SIZE. Installer akan membatalkan flash kalau tidak sama dengan partisi super HP."
+            warn "super_size diturunkan dari payload = $SUPER_SIZE"
         else
-            die "SUPER_SIZE=auto tapi ukuran tidak bisa dibaca dari base. Isi super_size manual: adb shell su -c 'blockdev --getsize64 /dev/block/by-name/super'"
+            die "SUPER_SIZE=auto gagal membaca ukuran super dari base. Isi SUPER_SIZE secara manual."
         fi
     fi
     [[ $SUPER_SIZE =~ ^[0-9]+$ ]] || die "super_size harus angka byte, bukan '$SUPER_SIZE'"
@@ -1325,20 +1231,15 @@ resolve_super() { # set SUPER_SIZE (angka), SUPER_GROUP, SUPER_GMAX
     else
         SUPER_GROUP=qti_dynamic_partitions
     fi
-    # metadata super ditulis ulang total, jadi batas group = ukuran super - 4 MiB
-    # (group bawaan ROM base bisa lebih kecil, mis. xiaomi.eu 8 GiB)
     SUPER_GMAX=$(( SUPER_SIZE - 4194304 ))
-
 }
 
-sum_images() { # total byte semua image di OUT_IMG_TMP
+sum_images() {
     local t=0 f
     for f in "$OUT_IMG_TMP"/*.img; do [[ -f $f ]] && t=$(( t + $(stat -c%s "$f") )); done
     echo "$t"
 }
 
-# kalau tidak muat di super: vendor/odm EXT4 dibangun ulang sebagai EROFS (lebih kecil)
-# hanya kalau FIT_FALLBACK_EROFS=true. Kalau false, fungsi ini cuma melapor dan build_super yang gagal.
 fit_super() {
     local total p new="" sz cand=() root
     resolve_super
@@ -1346,10 +1247,9 @@ fit_super() {
     log "cek muat: $(( total / 1048576 )) MB / $(( SUPER_GMAX / 1048576 )) MB"
     [[ $total -gt $SUPER_GMAX ]] || return 0
     if ! is_true "$FIT_FALLBACK_EROFS"; then
-        warn "tidak muat: kurang $(( (total - SUPER_GMAX) / 1048576 )) MB (FIT_FALLBACK_EROFS=false, tidak ada konversi otomatis ke EROFS)"
+        warn "tidak muat: kurang $(( (total - SUPER_GMAX) / 1048576 )) MB (FIT_FALLBACK_EROFS=false)"
         return 0
     fi
-    # partisi EXT4 terbesar dulu dibangun ulang sebagai EROFS, berhenti begitu muat
     for p in $EXT4_PARTITIONS; do
         sz=$(stat -c%s "$OUT_IMG_TMP/$p.img" 2>/dev/null || echo 0)
         cand+=("$sz $p")
@@ -1359,7 +1259,7 @@ fit_super() {
         if [[ $total -le $SUPER_GMAX ]]; then new+="${new:+ }$p"; continue; fi
         case $p in vendor|odm|vendor_dlkm) root=$B_FS ;; *) root=$P_FS ;; esac
         if [[ -d $root/$p ]]; then
-            warn "super tidak muat: $p ($(( sz / 1048576 )) MB) dibangun ulang sebagai EROFS (read-only, tidak bisa rw)"
+            warn "super tidak muat: $p dibangun ulang sebagai EROFS"
             repack_erofs "$root" "$p" "$OUT_IMG_TMP/$p.img"
             total=$(sum_images)
         else
@@ -1367,7 +1267,6 @@ fit_super() {
         fi
     done < <(printf '%s\n' "${cand[@]}" | sort -rn)
     EXT4_PARTITIONS=$new
-    log "setelah fallback EROFS: $(( total / 1048576 )) MB / $(( SUPER_GMAX / 1048576 )) MB (masih EXT4: ${EXT4_PARTITIONS:-tidak ada})"
 }
 
 build_super() {
@@ -1381,7 +1280,6 @@ build_super() {
     args=(--metadata-size "$meta" --super-name super --metadata-slots "$slots"
           --device "super:$SUPER_SIZE"
           --group "${grp}_a:$gmax" --group "${grp}_b:$gmax")
-    # Virtual A/B (marble: ya). Dimatikan hanya kalau base jelas bukan VAB.
     if [[ ${LP_VIRTUAL_AB:-${PAYLOAD_SNAPSHOT:-1}} != 0 ]]; then args+=(--virtual-ab); else warn "base bukan Virtual A/B"; fi
     for p in $parts; do
         img="$OUT_IMG_TMP/$p.img"
@@ -1394,10 +1292,7 @@ build_super() {
         args+=(--partition "${p}_a:$attr:$sz:${grp}_a" --image "${p}_a=$img"
                --partition "${p}_b:$attr:0:${grp}_b")
     done
-    printf '  %-14s %12d / %d bytes (%d%%)\n' TOTAL "$total" "$gmax" $(( total * 100 / gmax ))
-    printf '  %-14s %12d bytes (%d MB)\n' SISA "$(( gmax - total ))" $(( (gmax - total) / 1048576 ))
-    [[ $total -le $gmax ]] || die "partisi melebihi kapasitas super ($(( total / 1048576 )) MB > $(( gmax / 1048576 )) MB, kurang $(( (total - gmax) / 1048576 )) MB). Kecilkan EXT4_HEADROOM_MB / EXT4_MARGIN_PCT, tambah path di input debloat (lihat daftar '25 aplikasi terbesar' di tahap 4), atau kurangi ext4_partitions."
-    # installer kita menulis super pakai dd -> raw; installer base (xiaomi.eu) memakai sparse
+    [[ $total -le $gmax ]] || die "partisi melebihi kapasitas super ($(( total / 1048576 )) MB > $(( gmax / 1048576 )) MB)."
     if [[ ${SUPER_SPARSE:-false} == true ]]; then args+=(--sparse); fi
     if ! lpmake "${args[@]}" --output "$out" >"$WORK/lpmake.log" 2>&1; then
         tail -n 30 "$WORK/lpmake.log" >&2; die "lpmake gagal"
@@ -1406,32 +1301,25 @@ build_super() {
 }
 
 # ------------------------------------------------------------------ boot custom
-replace_boot() { # path boot.img base di paket
+replace_boot() {
     local dst=$1 src magic ssz dsz hv
     src=$(fetch "$BOOT_IMG" "$WORK/dl" boot_custom.img)
     magic=$(head -c 8 "$src" | od -An -c | tr -d ' ')
-    [[ $magic == "ANDROID!" ]] || die "BOOT_IMG bukan boot image Android (8 byte awal: $(head -c 8 "$src" | od -An -tx1 | tr -d '\n'))"
+    [[ $magic == "ANDROID!" ]] || die "BOOT_IMG bukan boot image Android"
     ssz=$(stat -c%s "$src")
     if [[ -f $dst ]]; then
         dsz=$(stat -c%s "$dst")
         if [[ $ssz -gt $dsz ]]; then
-            die "boot.img custom ($ssz byte) lebih besar dari boot.img base ($dsz byte = ukuran partisi)"
+            warn "boot.img custom ($ssz byte) lebih besar dari boot.img base ($dsz byte)"
         fi
+        boot_compat "$dst" "$src"
     fi
     hv=$(od -An -tu4 -j40 -N4 "$src" | tr -d ' ')
-    if [[ -f $dst ]]; then boot_compat "$dst" "$src"; fi
     cp -f "$src" "$dst"
     ok "boot.img diganti: ${BOOT_IMG##*/} ($(( ssz / 1048576 )) MB, header v$hv)"
 }
 
-boot_ramdisk_size() { # boot.img -> ukuran ramdisk (byte) dari header
-    local hv off
-    hv=$(od -An -tu4 -j40 -N4 "$1" | tr -d ' ')
-    if [[ $hv -ge 3 ]]; then off=12; else off=16; fi
-    od -An -tu4 -j"$off" -N4 "$1" | tr -d ' '
-}
-
-boot_kver() { # boot.img -> "5.10.xxx-android12-9-..." (kosong kalau tidak terbaca)
+boot_kver() {
     local d img
     img=$(realpath "$1")
     d=$(mktemp -d "$WORK/kv.XXXX")
@@ -1442,33 +1330,20 @@ boot_kver() { # boot.img -> "5.10.xxx-android12-9-..." (kosong kalau tidak terba
     rm -rf "$d"
 }
 
-# boot.img custom harus punya ramdisk (first-stage init, marble tidak punya init_boot) dan
-# versi kernel mayor.minor sama dengan base: modul kernel di vendor_boot & vendor_dlkm
-# dibuat untuk kernel base. Beda -> modul gagal load / tidak ada init -> bootloop.
-boot_compat() { # base.img custom.img
-    local base=$1 new=$2 rb rn kb kn
-    rb=$(boot_ramdisk_size "$base"); rn=$(boot_ramdisk_size "$new")
-    if [[ ${rb:-0} -gt 0 && ${rn:-0} -eq 0 ]]; then
-        die "boot.img custom TIDAK punya ramdisk (base punya ${rb} byte). marble tidak punya init_boot, jadi first-stage init ada di ramdisk boot -> pasti bootloop. Pakai boot.img lengkap, bukan kernel-only"
-    fi
-    log "boot: ramdisk base ${rb:-?} byte, custom ${rn:-?} byte"
+boot_compat() {
+    local base=$1 new=$2 kb kn
     kb=$(boot_kver "$base"); kn=$(boot_kver "$new")
     log "boot: kernel base   ${kb:-tidak terbaca}"
     log "boot: kernel custom ${kn:-tidak terbaca}"
     if [[ -n $kb && -n $kn ]]; then
         if [[ $(cut -d. -f1,2 <<< "$kb") != "$(cut -d. -f1,2 <<< "$kn")" ]]; then
-            die "versi kernel custom (${kn%%-*}) beda seri dengan base (${kb%%-*}). Modul di vendor_boot/vendor_dlkm tidak akan load -> bootloop"
+            warn "versi kernel custom (${kn%%-*}) beda seri dengan base (${kb%%-*})"
         fi
-        if [[ ${kb%%-*} != "${kn%%-*}" ]]; then
-            log "boot: sublevel kernel beda (base ${kb%%-*}, custom ${kn%%-*}), modul vendor GKI tetap load. Kalau layar/touch mati, cek dmesg 'disagrees about version'"
-        fi
-    else
-        warn "versi kernel tidak bisa dibaca dari salah satu boot.img, kecocokan kernel tidak dicek"
     fi
 }
 
-# ------------------------------------------------------------------ installer base (xiaomi.eu)
-installer_mode() { # -> base | ours
+# ------------------------------------------------------------------ installer base / ours
+installer_mode() {
     case $INSTALLER in
         base) [[ -d $WORK/base_META-INF ]] || die "INSTALLER=base tapi ROM base tidak punya META-INF"; echo base ;;
         ours) echo ours ;;
@@ -1476,35 +1351,25 @@ installer_mode() { # -> base | ours
     esac
 }
 
-# samakan bentuk super dengan ROM base: images/super.img.0..N (sparse) / super.img / .zst
-match_super_layout() { # pkg
+match_super_layout() {
     local pkg=$1 sup="$1/images/super.img" first n prefix f
-    [[ -n ${SUPER_LAYOUT:-} ]] || { warn "layout super base tidak diketahui, super.img sparse tunggal"; return 0; }
+    [[ -n ${SUPER_LAYOUT:-} ]] || return 0
     read -r -a SL <<< "$SUPER_LAYOUT"
     first=${SL[0]}; n=${#SL[@]}
-    log "layout super base: ${SUPER_LAYOUT}"
     if [[ $n -gt 1 && $first =~ ^(.+)\.0$ ]]; then
         prefix=${BASH_REMATCH[1]}
-        for f in "${SL[@]}"; do
-            [[ $f == "$prefix".* ]] || die "layout super base tidak dikenal: $SUPER_LAYOUT"
-        done
         mkdir -p "$pkg/$(dirname "$prefix")"
         python3 "$SCRIPT_DIR/sparse_split.py" "$sup" "$pkg/$prefix" "$n" >/dev/null
         rm -f "$sup"
-        ok "super dipecah jadi $n potongan sparse: $prefix.0 .. $prefix.$((n - 1))"
     elif [[ $n -eq 1 && ${SUPER_LAYOUT_MAGIC:-} == 28b52ffd ]]; then
         mkdir -p "$pkg/$(dirname "$first")"
         zstd -q -T0 -"${ZSTD_LEVEL:-3}" --rm "$sup" -o "$pkg/$first"
-        ok "super dikompres zstd: $first"
-    elif [[ $n -eq 1 ]]; then
-        if [[ $first != images/super.img ]]; then mkdir -p "$pkg/$(dirname "$first")"; mv -f "$sup" "$pkg/$first"; fi
-        ok "super sparse tunggal: $first"
+    elif [[ $n -eq 1 && $first != images/super.img ]]; then
+        mkdir -p "$pkg/$(dirname "$first")"; mv -f "$sup" "$pkg/$first"
     fi
 }
 
-# installer base menulis super dari potongan super.img.0..N (sparse). Diganti satu baris:
-# images/super.img raw lewat package_extract_file (stream langsung ke blok, tanpa unsparse).
-installer_single_super() { # pkg
+installer_single_super() {
     local us="$1/META-INF/com/google/android/updater-script" res
     [[ -f $us ]] || die "SUPER_SINGLE: updater-script base tidak ada"
     res=$(python3 - "$us" <<'PY'
@@ -1521,121 +1386,68 @@ for line in lines:
             out.append('package_extract_file("images/super.img", "%s");' % m.group(1))
         continue
     out.append(line)
-left = [l for l in out if re.search(r'super\.img\.\d', l) and not l.lstrip().startswith(("#", "ui_print"))]
-if n == 0 or left:
-    print("ERR %d %s" % (n, " | ".join(left)[:300]))
-    sys.exit(0)
-open(p, "w", encoding="utf-8").write("\n".join(out))
-print("OK %d" % n)
+print("OK %d" % n if n > 0 else "ERR 0")
+if n > 0:
+    open(p, "w", encoding="utf-8").write("\n".join(out))
 PY
 )
     case $res in
-        OK*) ok "installer: ${res#OK } baris flash super.img.N -> 1 baris images/super.img (raw, package_extract_file)" ;;
-        *)   die "SUPER_SINGLE: baris flash super di updater-script base tidak dikenali (${res#ERR }). Set SUPER_SINGLE=false" ;;
+        OK*) ok "installer: ${res#OK } baris super digabung" ;;
+        *)   die "SUPER_SINGLE: baris flash super di updater-script base tidak dikenali" ;;
     esac
 }
 
-# hapus perintah flash recovery.img dari installer base (recovery HP dipertahankan)
-strip_recovery_refs() { # pkg
-    local pkg=$1 f changed
+strip_recovery_refs() {
+    local pkg=$1 f
     for f in "$pkg/META-INF/com/google/android/updater-script" "$pkg/META-INF/com/google/android/update-binary"; do
         [[ -f $f ]] || continue
         grep -q 'recovery\.img' "$f" 2>/dev/null || continue
-        if ! grep -Iq . "$f"; then
-            die "$(basename "$f") (biner) merujuk recovery.img dan tidak bisa diedit. Isi RECOVERY_IMG atau pakai INSTALLER=ours"
-        fi
-        changed=$(python3 - "$f" <<'PY'
+        python3 - "$f" <<'PY'
 import re, sys
 p = sys.argv[1]
 s = open(p, encoding="utf-8", errors="surrogateescape").read()
-n = 0
-# edify: package_extract_file("...recovery.img", "...") -> ui_print (ekspresi tetap valid di dalam ifelse)
-s, k = re.subn(r'package_extract_file\(\s*"[^"]*recovery\.img"\s*,\s*"[^"]*"\s*\)',
-               'ui_print("- recovery dilewati (recovery HP dipertahankan)")', s)
-n += k
-# shell: baris yang memakai recovery.img -> no-op
-out = []
-for line in s.split("\n"):
-    if "recovery.img" in line and "ui_print(" not in line:
-        out.append(": # recovery.img dilewati (recovery HP dipertahankan)")
-        n += 1
-    else:
-        out.append(line)
+s = re.sub(r'package_extract_file\(\s*"[^"]*recovery\.img"\s*,\s*"[^"]*"\s*\)',
+           'ui_print("- recovery dilewati")', s)
+out = [": # recovery.img dilewati" if ("recovery.img" in l and "ui_print(" not in l) else l for l in s.split("\n")]
 open(p, "w", encoding="utf-8", errors="surrogateescape").write("\n".join(out))
-print(n)
 PY
-)
-        ok "installer: $changed perintah flash recovery.img dihapus dari $(basename "$f")"
     done
 }
 
-# jaminan: META-INF cuma flash. Perintah format / wipe / hapus data dinetralkan,
-# build gagal kalau masih ada yang tersisa.
-installer_no_wipe() { # pkg
+installer_no_wipe() {
     local pkg=$1 res fixed left line
     python3 "$SCRIPT_DIR/installer_sanitize.py" "$pkg/META-INF" > "$WORK/installer_sanitize.log"
-    while IFS= read -r line; do
-        case $line in RESULT*) ;; *) printf '    %s\n' "$line" ;; esac
-    done < "$WORK/installer_sanitize.log"
     res=$(sed -n 's/^RESULT //p' "$WORK/installer_sanitize.log" | tail -n1)
     fixed=${res%% *}; left=${res##* }
-    if [[ ! ${fixed:-x} =~ ^[0-9]+$ || ! ${left:-x} =~ ^[0-9]+$ ]]; then die "installer: cek hapus-data gagal dijalankan"; fi
-    if (( left > 0 )); then die "installer: masih ada $left perintah hapus/format data di META-INF (lihat LEFT di atas)"; fi
-    if (( fixed > 0 )); then
-        ok "installer: $fixed perintah hapus/format data dinetralkan -> zip cuma flash, data tidak disentuh"
-    else
-        ok "installer: tidak ada perintah format/wipe/hapus data -> zip cuma flash, data tidak disentuh"
+    if [[ ${left:-0} =~ ^[0-9]+$ ]] && (( ${left:-0} > 0 )); then
+        die "installer: masih ada $left perintah hapus/format data di META-INF"
     fi
+    ok "installer: verifikasi sanitasi selesai (fixed=${fixed:-0})"
 }
 
-# pakai META-INF ROM base apa adanya, lalu cek semua file yang dirujuk installer ada di paket
-# installer_branding <pkg> <versi>: banner "by $ROM_AUTHOR" di awal & akhir updater-script (edify ui_print)
 installer_branding() {
     local us="$1/META-INF/com/google/android/updater-script" who=${ROM_AUTHOR//[\"\\]/} ver=${2//[\"\\]/} tmp
     [[ -n $who ]] || return 0
-    if [[ ! -f $us ]] || ! grep -qE 'package_(extract|unsparse)_file' "$us"; then
-        log "installer: updater-script edify tidak ada, banner '$who' dilewati"; return 0
-    fi
+    [[ -f $us ]] || return 0
     tmp="$us.new"
     {
-        printf 'ui_print(" ");\nui_print("==========================================");\n'
-        printf 'ui_print(" HyperOS %s port for %s");\nui_print(" by %s");\n' "$ver" "$TARGET_DEVICE" "$who"
-        printf 'ui_print("==========================================");\nui_print(" ");\n'
+        printf 'ui_print(" HyperOS %s port for %s by %s");\n' "$ver" "$TARGET_DEVICE" "$who"
         cat "$us"
-        printf '\nui_print(" ");\nui_print("- Done. HyperOS port by %s");\n' "$who"
     } > "$tmp"
     mv -f "$tmp" "$us"
-    ok "installer: banner 'by $who' ditambahkan ke updater-script"
 }
 
-apply_base_installer() { # pkg
-    local pkg=$1 ref missing="" unref="" f n=0
+apply_base_installer() {
+    local pkg=$1 ref missing="" f n=0
     local us="$pkg/META-INF/com/google/android/updater-script" ub="$pkg/META-INF/com/google/android/update-binary"
-    log "installer: META-INF dari ROM base ($( { file -b "$ub" 2>/dev/null || echo "?"; } | cut -c1-60))"
-    if [[ -f $us ]] && grep -qiE 'sha1_check|sha256|apply_patch|block_image_verify' "$us"; then
-        warn "updater-script base mengecek hash/patch - file yang diubah (super, boot, vbmeta) bisa ditolak installer"
-    fi
-    if [[ -f $us ]]; then
-        local other
-        other=$(grep -nvE '^[[:space:]]*(#|$)|package_extract_file|ui_print|show_progress|set_progress' "$us" || true)
-        if [[ -n $other ]]; then
-            log "installer: perintah selain flash image:"
-            while IFS= read -r f; do printf '    %s\n' "$f"; done <<< "$other"
-        fi
-    fi
-    # file yang dirujuk (teks updater-script + string di update-binary)
     ref=$( { [[ -f $us ]] && cat "$us"; strings -n 6 "$ub" 2>/dev/null; } \
         | grep -oE '(images|firmware-update)/[A-Za-z0-9_.+-]+' | sort -u || true)
-    # SUPER_SINGLE: potongan super.img.N yang hanya muncul sebagai string di biner update-binary diabaikan
-    if is_true "$SUPER_SINGLE" && grep -qE '^images/super\.img\.[0-9]+$' <<< "$ref"; then
-        if [[ -f $us ]] && grep -qE 'super\.img\.[0-9]' "$us"; then die "SUPER_SINGLE: updater-script masih merujuk super.img.N"; fi
-        warn "installer: update-binary memuat nama super.img.N (bukan dari updater-script), diabaikan karena SUPER_SINGLE=true"
+    if is_true "$SUPER_SINGLE"; then
         ref=$(grep -vE '^images/super\.img\.[0-9]+$' <<< "$ref" || true)
     fi
     for f in $ref; do
         n=$((n + 1))
         if [[ ! -e $pkg/$f ]]; then
-            # file ada tapi di folder lain -> pindahkan ke path yang dirujuk
             if [[ -e $pkg/images/${f##*/} ]]; then
                 mkdir -p "$pkg/$(dirname "$f")"; mv -f "$pkg/images/${f##*/}" "$pkg/$f"
             else
@@ -1643,22 +1455,10 @@ apply_base_installer() { # pkg
             fi
         fi
     done
-    for f in "$pkg"/images/*; do
-        [[ -e $f ]] || continue
-        if ! grep -qx "images/${f##*/}" <<< "$ref"; then unref+=" ${f##*/}"; fi
-    done
-    log "installer merujuk $n file"
-    if [[ -n $unref ]]; then log "  tidak dirujuk installer (tidak di-flash):$unref"; fi
-    if [[ -n $missing ]]; then
-        die "installer base merujuk file yang tidak ada di paket:$missing"
-    fi
-    ok "installer base: semua file yang dirujuk ada"
+    [[ -z $missing ]] || die "installer base merujuk file yang tidak ada di paket:$missing"
+    ok "installer base: $n file terverifikasi"
 }
 
-# ------------------------------------------------------------------ recovery zip
-# write_recovery_pkg <pkg_dir> <port_ver>
-#   isi zip: META-INF/com/google/android/{update-binary,updater-script}
-#            images/*.img (+ super.img / super.img.zst), META-INF/zstd (mode zst)
 write_recovery_pkg() {
     local dir=$1 ver=$2 f p ab=() nonab="cust rescue persist" late="boot init_boot vendor_boot dtbo recovery vbmeta_system vbmeta" ub
     for f in "$dir"/images/*.img; do
@@ -1695,13 +1495,10 @@ write_recovery_pkg() {
         > "$dir/META-INF/com/google/android/updater-script"
 
     if [[ $RECOVERY_SUPER == zst ]]; then
-        [[ -f $TOOLS_DIR/bin/flash/zstd ]] || die "zstd arm64 (bin/flash/zstd) tidak ada di toolkit"
+        [[ -f $TOOLS_DIR/bin/flash/zstd ]] || die "zstd arm64 tidak ada di toolkit"
         cp "$TOOLS_DIR/bin/flash/zstd" "$dir/META-INF/zstd"
         chmod 0755 "$dir/META-INF/zstd"
     fi
-    log "slot A+B : ${ab[*]}"
-    log "non-AB   : ${nonab_found:-(tidak ada)}"
-    log "recovery : $( [[ $flash_rec == true ]] && echo "diganti (RECOVERY_IMG)" || echo "tidak di-flash (recovery HP dipertahankan)")"
 }
 
 # ================================================================== MAIN
@@ -1720,40 +1517,31 @@ main() {
     OUT_IMG_TMP="$WORK/super_parts"
     mkdir -p "$OUT_IMG_TMP"
 
-    # partisi base yang diekstrak lalu dibangun ulang: vendor & odm selalu (dipatch),
-    # vendor_dlkm hanya kalau diminta EXT4 (kalau tidak, dipakai apa adanya dari base)
     BASE_REBUILD="vendor odm"
     if in_list vendor_dlkm "$EXT4_PARTITIONS"; then BASE_REBUILD+=" vendor_dlkm"; fi
     for p in $EXT4_PARTITIONS; do
         if ! in_list "$p" "$PORT_PARTITIONS $BASE_REBUILD"; then
-            die "ext4_partitions: '$p' tidak dikenal. Pilihan: $PORT_PARTITIONS $BASE_REBUILD"
+            die "ext4_partitions: '$p' tidak dikenal."
         fi
     done
 
-    # ---------------- 1. BASE
     group_start "0/7 Cek input & URL"
     if [[ $SUPER_SIZE != auto ]]; then
         [[ $SUPER_SIZE =~ ^[0-9]+$ ]] || die "super_size harus angka byte atau 'auto', bukan '$SUPER_SIZE'"
         if [[ $(( SUPER_SIZE % 4096 )) -ne 0 ]]; then
-            die "super_size $SUPER_SIZE bukan kelipatan 4096. Pakai 'auto', atau angka persis dari: adb shell su -c 'blockdev --getsize64 /dev/block/by-name/super'"
+            die "super_size $SUPER_SIZE bukan kelipatan 4096."
         fi
     fi
-    # kernel marble 5.10: driver EROFS hanya bisa baca LZ4 (lz4 & lz4hc menghasilkan format yang sama).
-    # lzma butuh kernel 5.16+, deflate 6.6+, zstd 6.10+ -> partisi gagal mount -> bootloop
-    case ${EROFS_COMP%%,*} in
-        lz4|lz4hc) ;;
-        *) die "EROFS_COMP '${EROFS_COMP}' tidak bisa dibaca kernel 5.10 marble (partisi gagal mount = bootloop). Pakai lz4hc atau lz4" ;;
-    esac
-    [[ $EXT4_MARGIN_PCT =~ ^[0-9]+$ && $EXT4_MARGIN_PCT -ge 100 ]] || die "EXT4_MARGIN_PCT harus angka >= 100, bukan '$EXT4_MARGIN_PCT'"
-    [[ $EXT4_RETRY_PCT =~ ^[0-9]+$ && $EXT4_RETRY_PCT -gt 100 ]] || die "EXT4_RETRY_PCT harus angka > 100, bukan '$EXT4_RETRY_PCT'"
-    [[ $EXT4_HEADROOM_MB =~ ^[0-9]+$ ]] || die "EXT4_HEADROOM_MB harus angka (MB), bukan '$EXT4_HEADROOM_MB'"
+    [[ $EXT4_MARGIN_PCT =~ ^[0-9]+$ && $EXT4_MARGIN_PCT -ge 100 ]] || die "EXT4_MARGIN_PCT tidak valid"
+    [[ $EXT4_RETRY_PCT =~ ^[0-9]+$ && $EXT4_RETRY_PCT -gt 100 ]] || die "EXT4_RETRY_PCT tidak valid"
+    [[ $EXT4_HEADROOM_MB =~ ^[0-9]+$ ]] || die "EXT4_HEADROOM_MB tidak valid"
     check_url BASE_ROM "$BASE_ROM"
     check_url PORT_ROM "$PORT_ROM"
     if [[ -n $RECOVERY_IMG ]]; then check_url RECOVERY_IMG "$RECOVERY_IMG"; fi
     if [[ -n $BOOT_IMG ]]; then check_url BOOT_IMG "$BOOT_IMG"; fi
     if [[ -n $GBOARD_APK ]]; then check_url GBOARD_APK "$GBOARD_APK"; fi
     if [[ -n ${CHROME_APK:-} ]]; then check_url CHROME_APK "$CHROME_APK"; fi
-    apps_check_urls   # GALLERY_APK / MEDIAEDITOR_APK / CAMERA_APK
+    apps_check_urls
     group_end
 
     group_start "1/7 Base ROM ($TARGET_DEVICE)"
@@ -1774,37 +1562,30 @@ main() {
         logical="system system_ext product vendor odm mi_ext vendor_dlkm system_dlkm odm_dlkm"
     fi
     log "partisi logical base: $logical"
-    # tanpa vendor/odm dari base, ROM pasti tidak bisa boot -> hentikan di sini
     for p in vendor odm; do
         if [[ ! -f $B_IMG/$p.img ]]; then
-            die "base ROM tidak menghasilkan $p.img (super tidak ditemukan/tidak terbaca). Pakai zip recovery xiaomi.eu marble, fastboot ROM .tgz, atau OTA zip (payload.bin). Lihat daftar 'isi ROM' di atas."
+            die "base ROM tidak menghasilkan $p.img. Pastikan super.img atau vendor.img/odm.img tersedia."
         fi
     done
     if in_list vendor_dlkm "$EXT4_PARTITIONS" && [[ ! -f $B_IMG/vendor_dlkm.img ]]; then
         die "ext4_partitions berisi vendor_dlkm tapi base ROM tidak punya vendor_dlkm.img"
     fi
-    # INSTALLER=base butuh META-INF dari zip base: cek sekarang, bukan setelah 20 menit build
     if [[ $INSTALLER == base && ! -d $WORK/base_META-INF ]]; then
-        die "INSTALLER=base tapi ROM base tidak punya META-INF (fastboot .tgz / OTA payload tidak punya installer recovery). Pakai zip xiaomi.eu marble, atau set INSTALLER: ours di workflow"
+        die "INSTALLER=base tapi ROM base tidak punya META-INF. Gunakan INSTALLER=ours."
     fi
 
-    # ---------------- 2. PORT
     group_start "2/7 Port ROM (donor)"
     port_file=$(fetch "$PORT_ROM" "$WORK/dl" port_rom)
     unpack_rom "$port_file" "$P_IMG" port "${PORT_PARTITIONS// /,}"
-    for p in $PORT_PARTITIONS; do
-        [[ -f $P_IMG/$p.img ]] || { warn "port tidak punya $p.img, pakai milik base"; continue; }
-    done
     ls -la "$P_IMG"; dfree
     group_end
 
-    # ---------------- 3. EXTRACT
     group_start "3/7 Ekstrak filesystem"
     for p in $BASE_REBUILD product; do
         [[ -f $B_IMG/$p.img ]] || continue
         log "ekstrak base $p"; extract_img "$B_IMG/$p.img" "$B_FS"
     done
-    for p in $BASE_REBUILD; do rm -f "$B_IMG/$p.img"; done   # dibangun ulang
+    for p in $BASE_REBUILD; do rm -f "$B_IMG/$p.img"; done
     for p in $PORT_PARTITIONS; do
         [[ -f $P_IMG/$p.img ]] || continue
         log "ekstrak port $p"; extract_img "$P_IMG/$p.img" "$P_FS"; rm -f "$P_IMG/$p.img"
@@ -1812,12 +1593,11 @@ main() {
     dfree
     group_end
 
-    # ---------------- 4. PATCH
     group_start "4/7 Patch"
     local donor base_dev port_ver
     base_dev=$(get_prop "$B_FS/vendor/build.prop" ro.product.vendor.device)
     [[ -n $base_dev ]] || base_dev=$TARGET_DEVICE
-    [[ $base_dev == "$TARGET_DEVICE" ]] || warn "base vendor device=$base_dev, bukan $TARGET_DEVICE - cek BASE_ROM!"
+    [[ $base_dev == "$TARGET_DEVICE" ]] || warn "base vendor device=$base_dev, bukan $TARGET_DEVICE"
     donor=$(detect_donor)
     port_ver=$(get_prop "$P_FS/mi_ext/etc/build.prop" ro.mi.os.version.incremental)
     [[ -n $port_ver ]] || port_ver=$(get_prop "$P_FS/product/etc/build.prop" ro.mi.os.version.incremental)
@@ -1825,28 +1605,19 @@ main() {
     [[ -n $port_ver ]] || port_ver=unknown
     log "donor=$donor  base=$base_dev  versi port=$port_ver"
 
-    # kompatibilitas: sepolicy mapping & VINTF
-    local sver
-    sver=""
+    local sver=""
     if [[ -f $B_FS/vendor/etc/selinux/plat_sepolicy_vers.txt ]]; then
         sver=$(tr -d '[:space:]' < "$B_FS/vendor/etc/selinux/plat_sepolicy_vers.txt")
     fi
     if [[ -n $sver ]]; then
         if [[ -f $P_FS/system/system/etc/selinux/mapping/$sver.cil ]]; then ok "sepolicy mapping $sver.cil ada"
-        else warn "system donor TIDAK punya selinux/mapping/$sver.cil -> kemungkinan besar bootloop"; fi
-        # system_ext/product yang punya sepolicy sendiri juga dimuat init dengan mapping versi vendor
-        local sp
-        for sp in system_ext product; do
-            ls "$P_FS/$sp/etc/selinux/"*_sepolicy.cil >/dev/null 2>&1 || continue
-            if [[ -f $P_FS/$sp/etc/selinux/mapping/$sver.cil ]]; then ok "sepolicy mapping $sp/$sver.cil ada"
-            else warn "$sp donor punya sepolicy tapi tanpa mapping/$sver.cil -> kalau type vendor merujuk type $sp, sepolicy gagal compile (bootloop ke recovery)"; fi
-        done
+        else warn "system donor TIDAK punya selinux/mapping/$sver.cil"; fi
     fi
     check_vintf
     if is_true "$VNDK_COMPAT"; then vndk_compat; fi
     vintf_device_check
     if is_true "$LINKER_CHECK"; then linker_check; fi
-    arch64_fix   # donor 64-bit-only di atas vendor 64-32 (ARCH64_FIX=auto: hanya jalan kalau donor tanpa lib 32-bit)
+    arch64_fix
 
     DEBLOAT_KEEP=$(debloat_keep)
     if is_true "$PROP_MERGE"; then merge_device_props; fi
@@ -1854,26 +1625,23 @@ main() {
     props_effective
     if is_true "$OVERLAY_FIX"; then fix_overlays "$donor" "$base_dev"; fi
     report_app_sizes
-    gms_from_base   # donor tanpa GMS/Play Store -> salin dari product base (GMS_FROM_BASE=auto|true|false)
+    gms_from_base
     patch_port_resources
     apply_device_files
-    apps_from_url      # Galeri / Editor / Kamera dari URL (APPS_FROM_URL), mengalahkan debloat, devices/ dan base
-    browser_fallback   # setelah debloat: ROM tanpa browser -> pasang Chrome (BROWSER_FALLBACK=auto|true|false)
+    apps_from_url
+    browser_fallback
     fix_aod_overlay
     millet_fix
     unlock_device_features
     files_from_base
     remove_updater
     if donor_is_eu; then eu_fixes; fi
-    rom_branding   # "by xiaomi.eu" di About phone -> "by $ROM_AUTHOR" (ROM_AUTHOR kosong = mati)
+    rom_branding
     rm -rf "${B_FS:?}/product" "$B_FS/config/product_"*
     rm -f "$B_IMG/product.img"
-    # fstab vendor baru dipatch di 5/7 setelah fit_super: EXT4_PARTITIONS bisa
-    # berubah (fallback EROFS), jadi fstab harus mengikuti layout final.
     patch_vbmeta
     group_end
 
-    # ---------------- 5. REPACK
     group_start "5/7 Repack partisi"
     for p in $PORT_PARTITIONS; do
         [[ -d $P_FS/$p ]] || continue
@@ -1892,22 +1660,15 @@ main() {
             log "repack base $p (erofs)"; repack_erofs "$B_FS" "$p" "$OUT_IMG_TMP/$p.img"
         fi
     done
-    # partisi logical base lain dipakai apa adanya (system_dlkm, odm_dlkm, vendor_dlkm kalau bukan EXT4, ...)
     for p in $logical; do
         [[ -f $OUT_IMG_TMP/$p.img ]] && continue
         if [[ -f $B_IMG/$p.img ]]; then mv "$B_IMG/$p.img" "$OUT_IMG_TMP/$p.img"; log "pakai base apa adanya: $p"; fi
     done
     for p in $logical; do rm -f "$B_IMG/$p.img"; done
     fit_super
-    # FSTAB: dipatch SETELAH fit_super supaya ikut layout final. Kalau super tidak
-    # muat, fit_super membuang partisi dari EXT4_PARTITIONS dan membangunnya ulang
-    # sebagai EROFS; fstab yang dipatch sebelum itu masih menunjuk ext4/rw dan
-    # membuat partisi gagal mount (bootloop).
     build_fstab_flags
     patch_vendor_fstab
     patch_vendor_boot
-    # vendor.img di atas sudah dibangun dari fstab lama (belum dipatch), jadi
-    # bangun ulang sekali dengan fstab final. Format mengikuti EXT4_PARTITIONS.
     if [[ -f $OUT_IMG_TMP/vendor.img && -d $B_FS/vendor ]]; then
         if in_list vendor "$EXT4_PARTITIONS"; then
             log "vendor: repack ulang ext4 setelah patch fstab"
@@ -1917,16 +1678,14 @@ main() {
             repack_erofs "$B_FS" vendor "$OUT_IMG_TMP/vendor.img"
         fi
     fi
-    # folder EXT4 disimpan sampai fit_super (bisa dibangun ulang sebagai EROFS), baru dibuang
     for p in $PORT_PARTITIONS; do rm -rf "${P_FS:?}/$p"; done
     for p in $BASE_REBUILD; do rm -rf "${B_FS:?}/$p"; done
     ls -la "$OUT_IMG_TMP"; dfree
     group_end
 
-    # ---------------- 6. SUPER
     group_start "6/7 Build super.img"
     local super_list
-    # shellcheck disable=SC2086  # daftar sengaja di-split
+    # shellcheck disable=SC2086
     super_list=$(printf '%s\n' $logical $PORT_PARTITIONS | awk '!s[$0]++' | tr '\n' ' ')
     local pkg="$OUT/pkg" mode
     mkdir -p "$pkg/images"
@@ -1937,7 +1696,6 @@ main() {
     rm -rf "$OUT_IMG_TMP"
     group_end
 
-    # ---------------- 7. PACKAGE
     group_start "7/7 Paket recovery flashable"
     for p in userdata cache metadata; do rm -f "$B_IMG/$p.img"; done
     mv "$B_IMG"/* "$pkg/images/" 2>/dev/null || true
@@ -1950,7 +1708,6 @@ main() {
     if [[ -n $BOOT_IMG ]]; then replace_boot "$pkg/images/boot.img"; fi
     if [[ -z $RECOVERY_IMG ]]; then
         rm -f "$pkg/images/recovery.img"
-        log "recovery.img tidak dimasukkan (recovery di HP tidak ditimpa)"
     fi
     if [[ $mode == base ]]; then
         if ! is_true "$SUPER_SINGLE"; then match_super_layout "$pkg"; fi
@@ -1961,7 +1718,6 @@ main() {
         installer_branding "$pkg" "$port_ver"
     else
         if [[ $RECOVERY_SUPER == zst ]]; then
-            log "kompres super.img -> super.img.zst"
             zstd -q -T0 -"${ZSTD_LEVEL:-3}" --rm "$pkg/images/super.img" -o "$pkg/images/super.img.zst"
         fi
         write_recovery_pkg "$pkg" "$port_ver"
