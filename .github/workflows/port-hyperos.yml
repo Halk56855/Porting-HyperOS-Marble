@@ -117,25 +117,21 @@ jobs:
           OUT_FW="$GITHUB_WORKSPACE/work/base_fw"
           mkdir -p "$OUT_FW"
 
-          AUTH_ARGS=()
-          [[ -n "${SAM_IMEI:-}" ]] && AUTH_ARGS+=(--imei "$SAM_IMEI")
-          [[ -n "${SAM_SERIAL:-}" ]] && AUTH_ARGS+=(--serial "$SAM_SERIAL")
-
           if command -v samloader-rs >/dev/null 2>&1; then
+            samloader-rs --help || true
+            AUTH_ARGS=()
+            [[ -n "${SAM_IMEI:-}" ]] && AUTH_ARGS+=(--imei "$SAM_IMEI")
+            [[ -n "${SAM_SERIAL:-}" ]] && AUTH_ARGS+=(--serial "$SAM_SERIAL")
             samloader-rs checkupdate -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" || true
             samloader-rs download -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW" || \
               samloader-rs pull -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW"
           elif command -v samloader >/dev/null 2>&1; then
-            IMEI_ARG=""
-            [[ -n "${SAM_IMEI:-}" ]] && IMEI_ARG="-I $SAM_IMEI"
-            [[ -z "$IMEI_ARG" && -n "${SAM_SERIAL:-}" ]] && IMEI_ARG="-S $SAM_SERIAL"
-            # shellcheck disable=SC2086
-            FW_VER=$(samloader -m "$SAM_MODEL" -r "$SAM_CSC" $IMEI_ARG checkupdate)
-            echo "Latest firmware version: $FW_VER"
-            # shellcheck disable=SC2086
-            samloader -m "$SAM_MODEL" -r "$SAM_CSC" $IMEI_ARG download -v "$FW_VER" -O "$OUT_FW"
+            samloader --help || true
+            samloader checkupdate "$SAM_MODEL" "$SAM_CSC" || samloader checkupdate --model "$SAM_MODEL" --region "$SAM_CSC" || true
+            samloader download "$SAM_MODEL" "$SAM_CSC" -O "$OUT_FW" || \
+              samloader download --model "$SAM_MODEL" --region "$SAM_CSC" -O "$OUT_FW"
           else
-            echo "Error: Neither samloader-rs nor samloader binary is available." >&2
+            echo "Error: samloader binary not found" >&2
             exit 1
           fi
 
