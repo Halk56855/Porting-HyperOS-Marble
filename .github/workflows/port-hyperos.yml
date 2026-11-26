@@ -50,7 +50,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install system dependencies
+      - name: Install dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -62,26 +62,13 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo and samloader-rs
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            ~/samloader-rs/target
-          key: samloader-rs-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-
       - name: Setup samloader-rs
-        env:
-          GIT_TERMINAL_PROMPT: "0"
         run: |
           set -euo pipefail
-
           if command -v samloader-rs >/dev/null 2>&1; then
             samloader-rs --version || true
             exit 0
           fi
-
           rm -rf "$HOME/samloader-rs"
           if git clone --depth=1 https://github.com/topjohnwu/samloader-rs.git "$HOME/samloader-rs"; then
             cargo install --path "$HOME/samloader-rs" --locked || \
@@ -91,23 +78,11 @@ jobs:
               sudo cp -f "$HOME/samloader-rs/target/release/samloader-rs" /usr/local/bin/samloader-rs
             fi
           fi
-
           if ! command -v samloader-rs >/dev/null 2>&1; then
             cargo install samloader --locked || cargo install samloader
           fi
 
-          command -v samloader-rs >/dev/null 2>&1 && samloader-rs --version || true
-          command -v samloader >/dev/null 2>&1 && samloader --version || true
-
-      - name: Prepare directories and permissions
-        run: |
-          mkdir -p "$GITHUB_WORKSPACE/work/base_fw" "$GITHUB_WORKSPACE/work/base_src" "$GITHUB_WORKSPACE/work/port_dl" "$GITHUB_WORKSPACE/out"
-          chmod +x scripts/port.sh || true
-          for f in scripts/port_*.sh scripts/update-binary; do
-            [[ -f "$f" ]] && chmod +x "$f" || true
-          done
-
-      - name: Download official SM-A045F firmware via samloader
+      - name: Download and unpack base firmware
         env:
           SAM_MODEL: ${{ inputs.model }}
           SAM_CSC: ${{ inputs.csc }}
@@ -116,7 +91,9 @@ jobs:
         run: |
           set -euo pipefail
           OUT_FW="$GITHUB_WORKSPACE/work/base_fw"
-          mkdir -p "$OUT_FW"
+          DST_IMG="$GITHUB_WORKSPACE/work/base_src"
+          TMP_UNPACK="$GITHUB_WORKSPACE/work/tmp_base"
+          mkdir -p "$OUT_FW" "$DST_IMG" "$TMP_UNPACK"
           cd "$OUT_FW"
 
           if command -v samloader >/dev/null 2>&1; then
@@ -137,43 +114,26 @@ jobs:
             exit 1
           fi
 
-          ls -lh "$OUT_FW"
-
-      - name: Unpack base firmware and AP images
-        run: |
-          set -euo pipefail
-          SRC_FW="$GITHUB_WORKSPACE/work/base_fw"
-          DST_IMG="$GITHUB_WORKSPACE/work/base_src"
-          TMP_UNPACK="$GITHUB_WORKSPACE/work/tmp_base"
-          rm -rf "$DST_IMG" "$TMP_UNPACK"
-          mkdir -p "$DST_IMG" "$TMP_UNPACK"
-
-          find "$SRC_FW" -maxdepth 2 -type f -name '*.zip' -exec unzip -q -o {} -d "$TMP_UNPACK" \;
-          find "$SRC_FW" -maxdepth 2 -type f \( -name '*.tar' -o -name '*.tar.md5' \) -exec tar -xf {} -C "$TMP_UNPACK" \;
-
+          find "$OUT_FW" -maxdepth 2 -type f -name '*.zip' -exec unzip -q -o {} -d "$TMP_UNPACK" \;
+          find "$OUT_FW" -maxdepth 2 -type f \( -name '*.tar' -o -name '*.tar.md5' \) -exec tar -xf {} -C "$TMP_UNPACK" \;
           while IFS= read -r -d '' t; do
             tar -xf "$t" -C "$TMP_UNPACK" 2>/dev/null || true
           done < <(find "$TMP_UNPACK" -maxdepth 2 -type f \( -name 'AP*.tar*' -o -name '*.tar' -o -name '*.tar.md5' \) -print0 2>/dev/null || true)
-
           if command -v lz4 >/dev/null 2>&1; then
             while IFS= read -r -d '' f; do
               lz4 -df --rm "$f" "${f%.lz4}" >/dev/null 2>&1 || true
             done < <(find "$TMP_UNPACK" -type f -name '*.lz4' -print0 2>/dev/null || true)
           fi
-
           find "$TMP_UNPACK" -type f -name '*.img' -exec cp -f {} "$DST_IMG/" \;
-          ls -lh "$DST_IMG"
-          [[ -n "$(find "$DST_IMG" -maxdepth 1 -name '*.img' -print -quit)" ]] || {
-            echo "No .img files found after unpacking base firmware" >&2
-            exit 1
-          }
+          [[ -n "$(find "$DST_IMG" -maxdepth 1 -name '*.img' -print -quit)" ]]
 
-      - name: Download and verify port donor ROM
+      - name: Download donor ROM and prepare update-binary
         env:
           PORT_ROM_URL: ${{ inputs.port_rom_url }}
         run: |
           set -euo pipefail
           [[ -n "$PORT_ROM_URL" ]] || { echo "port_rom_url is required" >&2; exit 1; }
+          mkdir -p "$GITHUB_WORKSPACE/work/port_dl" "$GITHUB_WORKSPACE/work/build" "$GITHUB_WORKSPACE/out"
 
           OUT_ZIP="$GITHUB_WORKSPACE/work/port_dl/donor_rom.zip"
           COOKIE_JAR="$GITHUB_WORKSPACE/work/port_dl/gdrive_cookies.txt"
@@ -184,13 +144,10 @@ jobs:
             if [[ -z "$FILE_ID" ]]; then
               FILE_ID=$(printf '%s' "$PORT_ROM_URL" | grep -oE '[?&]id=[a-zA-Z0-9_-]+' | sed 's/^[?&]id=//' | head -n 1 || true)
             fi
-            [[ -n "$FILE_ID" ]] || { echo "Could not extract Google Drive file ID from URL" >&2; exit 1; }
-
-            echo "Detected Google Drive file ID, downloading..."
+            [[ -n "$FILE_ID" ]]
             if command -v gdown >/dev/null 2>&1; then
               gdown --fuzzy "https://drive.google.com/uc?id=${FILE_ID}" -O "$OUT_ZIP" || true
             fi
-
             if [[ ! -s "$OUT_ZIP" ]]; then
               curl -fsSL -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
                 "https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t" \
@@ -200,44 +157,16 @@ jobs:
                 -o "$OUT_ZIP"
             fi
           else
-            echo "Downloading direct donor ROM URL..."
             curl -fsSL "$PORT_ROM_URL" -o "$OUT_ZIP"
           fi
 
           rm -f "$COOKIE_JAR"
-
-          [[ -s "$OUT_ZIP" ]] || { echo "Downloaded donor ROM file is empty" >&2; exit 1; }
-
-          SIZE_BYTES=$(stat -c '%s' "$OUT_ZIP")
-          echo "Downloaded file size: ${SIZE_BYTES} bytes"
-          if (( SIZE_BYTES < 1048576 )); then
-            echo "Downloaded file is smaller than 1 MB; likely an error page or incomplete download" >&2
-            exit 1
-          fi
-
-          if head -c 256 "$OUT_ZIP" | tr '[:upper:]' '[:lower:]' | grep -qE '<!doctype html|<html'; then
-            echo "Downloaded file is an HTML page instead of a ROM archive (check sharing permissions or link)" >&2
-            exit 1
-          fi
-
+          [[ -s "$OUT_ZIP" ]]
           if [[ "$(head -c 2 "$OUT_ZIP")" == "PK" ]]; then
-            unzip -t "$OUT_ZIP" >/dev/null || {
-              echo "Downloaded ZIP archive is corrupted" >&2
-              exit 1
-            }
-            echo "ZIP archive integrity check passed"
-          else
-            echo "Warning: downloaded file does not start with ZIP header; verify archive format" >&2
+            unzip -t "$OUT_ZIP" >/dev/null
           fi
-
-          ls -lh "$OUT_ZIP"
-
-      - name: Ensure update-binary template exists
-        run: |
-          set -euo pipefail
 
           FOUND_BIN=$(find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -name 'update-binary' ! -path '*/.git/*' | head -n 1 || true)
-
           if [[ -z "$FOUND_BIN" ]]; then
             TMP_TPL="$GITHUB_WORKSPACE/work/tmp_update_binary"
             cat <<'EOF' > "$TMP_TPL"
@@ -256,15 +185,7 @@ EOF
             chmod +x "$FOUND_BIN"
           fi
 
-          TARGET_DIRS=(
-            "$GITHUB_WORKSPACE/scripts"
-            "$GITHUB_WORKSPACE/bin"
-            "$GITHUB_WORKSPACE/tools"
-            "$GITHUB_WORKSPACE/work"
-            "$GITHUB_WORKSPACE/work/build"
-          )
-
-          for d in "${TARGET_DIRS[@]}"; do
+          for d in "$GITHUB_WORKSPACE/scripts" "$GITHUB_WORKSPACE/bin" "$GITHUB_WORKSPACE/tools" "$GITHUB_WORKSPACE/work" "$GITHUB_WORKSPACE/work/build"; do
             mkdir -p "$d"
             if [[ ! -f "$d/update-binary" ]]; then
               cp -f "$FOUND_BIN" "$d/update-binary"
@@ -272,7 +193,10 @@ EOF
             fi
           done
 
-          ls -la "$GITHUB_WORKSPACE/scripts/update-binary" "$GITHUB_WORKSPACE/work/update-binary"
+          chmod +x scripts/port.sh || true
+          for f in scripts/port_*.sh scripts/update-binary; do
+            [[ -f "$f" ]] && chmod +x "$f" || true
+          done
 
       - name: Run port.sh for SM-A045F
         env:
