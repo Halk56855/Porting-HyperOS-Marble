@@ -70,16 +70,47 @@ jobs:
           key: samloader-rs-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Install or build samloader-rs
+        env:
+          GIT_TERMINAL_PROMPT: "0"
         run: |
-          if ! command -v samloader-rs >/dev/null 2>&1; then
-            if [[ ! -d "$HOME/samloader-rs" ]]; then
-              git clone --depth=1 https://github.com/samloader/samloader-rs.git "$HOME/samloader-rs"
+          set -euo pipefail
+
+          if command -v samloader-rs >/dev/null 2>&1; then
+            samloader-rs --version
+            exit 0
+          fi
+
+          if cargo install samloader-rs --locked 2>/dev/null || cargo install samloader-rs 2>/dev/null; then
+            samloader-rs --version
+            exit 0
+          fi
+
+          REPOS=(
+            "https://github.com/samloader/samloader-rs.git"
+            "https://github.com/martinetd/samloader-rs.git"
+          )
+
+          CLONED=0
+          rm -rf "$HOME/samloader-rs"
+          for repo in "${REPOS[@]}"; do
+            echo "Trying git clone from: $repo"
+            if git clone --depth=1 "$repo" "$HOME/samloader-rs"; then
+              CLONED=1
+              break
             fi
-            cargo install --path "$HOME/samloader-rs" --locked || cargo build --manifest-path "$HOME/samloader-rs/Cargo.toml" --release
+          done
+
+          if [[ "$CLONED" -eq 1 ]]; then
+            cargo install --path "$HOME/samloader-rs" --locked || \
+              cargo build --manifest-path "$HOME/samloader-rs/Cargo.toml" --release
             if [[ -f "$HOME/samloader-rs/target/release/samloader-rs" ]]; then
               sudo cp -f "$HOME/samloader-rs/target/release/samloader-rs" /usr/local/bin/samloader-rs
             fi
+          else
+            echo "Error: Failed to clone samloader-rs from known repositories or install via cargo." >&2
+            exit 1
           fi
+
           samloader-rs --version
 
       - name: Prepare directories and permissions
