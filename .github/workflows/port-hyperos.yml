@@ -29,7 +29,7 @@ on:
         default: "auto"
 
 env:
-  TARGET_DEVICE: SM-A045F
+  TARGET_DEVICE: "SM-A045F"
   MILLET_FIX: "false"
   AOD_FIX: "false"
   ALLOW_XIAOMI_EU_EXTRAS: "false"
