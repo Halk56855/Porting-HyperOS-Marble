@@ -1,32 +1,19 @@
 #!/usr/bin/env bash
 # =============================================================================
-#  port_apps.sh - ganti app tertentu di ROM port dengan APK dari URL (default saat build)
-#  (di-source oleh port.sh; hanya berisi fungsi)
+#  port_apps.sh - ganti app tertentu di ROM port dengan APK dari URL/path
+#  (di-source oleh port.sh; disesuaikan agar tidak memakai preset khusus marble)
 #
-#  Default:
-#    GALLERY_APK     -> com.miui.gallery     (kosong = pakai galeri donor/base)
-#    MEDIAEDITOR_APK -> com.miui.mediaeditor (kosong = tidak dipasang; debloat menghapusnya)
-#    CAMERA_APK      -> com.android.camera   (default Camera 6.7.000070.0)
-#
-#  APPS_FROM_URL=false mematikan semua. URL dikosongkan (GALLERY_APK="") = lewati app itu saja.
-#  Boleh .apk atau bundle (.apkm/.xapk/.apks, base + semua split dipasang).
-#
-#  Cara kerja per app:
-#    - folder app yang paketnya sama di ROM port dicari lewat nama package (bukan nama folder),
-#      lalu DIGANTI UTUH (APK lama + lib lama + oat dibuang). Tidak ada -> dibuat di lokasi default.
-#    - lib native diekstrak ke <folder>/lib/arm64 (+ arm), seperti Gboard/Chrome
-#    - priv-app: dibuat allowlist privapp-permissions dari <uses-permission> APK, supaya izin
-#      privileged versi baru tidak membuat system_server crash saat boot (enforce)
-#  Dipanggil SETELAH debloat dan setelah file devices/, jadi mengalahkan keduanya
-#  (termasuk MiMediaEditor yang dihapus debloat dan MiuiCamera dari base).
+#  GALLERY_APK     -> com.miui.gallery     (kosong = pakai bawaan donor/base)
+#  MEDIAEDITOR_APK -> com.miui.mediaeditor (kosong = tidak dipasang)
+#  CAMERA_APK      -> com.android.camera   (kosong = pakai bawaan donor/base)
+#  APPS_FROM_URL   -> true/false
 # =============================================================================
 
-GALLERY_APK=${GALLERY_APK-}
-MEDIAEDITOR_APK=${MEDIAEDITOR_APK-}
-CAMERA_APK=${CAMERA_APK-https://github.com/Yudharmdn/boot-melt-rebase/releases/download/boot-melt-rebase/Camera_6.7.000070.0.apk}
-APPS_FROM_URL=${APPS_FROM_URL:-true}
+GALLERY_APK=${GALLERY_APK:-}
+MEDIAEDITOR_APK=${MEDIAEDITOR_APK:-}
+CAMERA_APK=${CAMERA_APK:-}
+APPS_FROM_URL=${APPS_FROM_URL:-false}
 
-# cek URL lebih awal (dipanggil dari tahap 0 di port.sh), supaya 404 ketahuan sebelum build 20 menit
 apps_check_urls() {
     is_true "$APPS_FROM_URL" || return 0
     if [[ -n $GALLERY_APK ]]; then check_url GALLERY_APK "$GALLERY_APK"; fi
@@ -35,7 +22,6 @@ apps_check_urls() {
     return 0
 }
 
-# apps_extract_libs <apk> <dir> : lib native -> <dir>/lib/arm64 (+ arm); cetak jumlah file
 apps_extract_libs() {
     python3 - "$1" "$2" <<'PY'
 import os, sys, zipfile
@@ -56,17 +42,16 @@ print(n)
 PY
 }
 
-# apps_privapp_allowlist <apk> <pkg> <rel dir app> : allowlist dari uses-permission APK
 apps_privapp_allowlist() {
-    local apk=$1 pkg=$2 dir=$3 etc out n=0 perm
+    local apk=$1 pkg=$2 dir=$3 etc out n=0 perm dev=${TARGET_DEVICE:-a04}
     case $dir in
         system/*) etc="$P_FS/system/system/etc/permissions" ;;
         *)        etc="$P_FS/${dir%%/*}/etc/permissions" ;;
     esac
     mkdir -p "$etc"
-    out="$etc/privapp-permissions-${TARGET_DEVICE}-apk-${pkg//./_}.xml"
+    out="$etc/privapp-permissions-${dev}-apk-${pkg//./_}.xml"
     {
-        printf '<?xml version="1.0" encoding="utf-8"?>\n<!-- dibuat port.sh dari <uses-permission> APK (port_apps.sh) -->\n<permissions>\n'
+        printf '<?xml version="1.0" encoding="utf-8"?>\n<permissions>\n'
         printf '    <privapp-permissions package="%s">\n' "$pkg"
         while IFS= read -r perm; do
             [[ $perm =~ ^[A-Za-z0-9_.]+$ ]] || continue
@@ -77,13 +62,12 @@ apps_privapp_allowlist() {
     chmod 0644 "$out"
     n=$(grep -c '<permission name=' "$out" || true)
     if [[ ${n:-0} -gt 0 ]]; then
-        ok "Apps: allowlist privapp $pkg: $n izin -> ${out#"$P_FS"/}"
+        ok "Apps: allowlist privapp $pkg ($n izin)"
     else
-        warn "Apps: $pkg tidak meminta izin apa pun? allowlist kosong dibuat (${out#"$P_FS"/})"
+        warn "Apps: allowlist kosong dibuat untuk $pkg"
     fi
 }
 
-# apps_install <label> <package yang diharapkan> <url/path> <folder default>
 apps_install() {
     local label=$1 want=$2 url=$3 def=$4
     local src tmp kind apk pkg idx="$WORK/apps/port_index.tsv" dir name old=0 new nlib d
@@ -94,22 +78,21 @@ apps_install() {
     kind=$(python3 "$SCRIPT_DIR/apk_bundle.py" "$src" "$tmp" base)
     case ${kind%% *} in
         apk)    ;;
-        bundle) log "Apps: $label berupa bundle: base + ${kind#* } split ikut dipasang" ;;
+        bundle) log "Apps: $label berupa bundle: base + split ikut dipasang" ;;
         *)      warn "Apps: $label bukan APK/bundle valid ($url), dilewati"; rm -rf "$tmp"; return 0 ;;
     esac
     apk="$tmp/base.apk"
     pkg=$(python3 "$SCRIPT_DIR/apk_index.py" --apk "$apk")
-    if [[ -z $pkg ]]; then warn "Apps: package $label tidak terbaca dari AndroidManifest, dilewati"; rm -rf "$tmp"; return 0; fi
+    if [[ -z $pkg ]]; then warn "Apps: package $label tidak terbaca, dilewati"; rm -rf "$tmp"; return 0; fi
     if [[ $pkg != "$want" ]]; then
         if is_true "${APPS_FORCE:-false}"; then
             warn "Apps: $label berpackage '$pkg', bukan $want (APPS_FORCE=true, tetap dipasang)"
         else
-            warn "Apps: $label berpackage '$pkg', bukan $want -> kemungkinan URL salah, app donor dibiarkan. APPS_FORCE=true untuk memaksa"
+            warn "Apps: $label berpackage '$pkg', bukan $want -> dilewati"
             rm -rf "$tmp"; return 0
         fi
     fi
 
-    # folder yang sudah memakai package ini di ROM port (lewat nama package, apa pun nama foldernya)
     python3 "$SCRIPT_DIR/apk_index.py" "$P_FS" > "$idx"
     mapfile -t dirs < <(awk -F'\t' -v p="$pkg" '$1 == p {print $2}' "$idx")
     if [[ ${#dirs[@]} -gt 0 ]]; then
@@ -123,7 +106,6 @@ apps_install() {
     if [[ ! -d $P_FS/${dir%%/*} ]]; then
         warn "Apps: partisi ${dir%%/*} tidak ada di ROM port, $label dilewati"; rm -rf "$tmp"; return 0
     fi
-    # package yang sama di folder lain = duplikat -> dibuang, supaya tidak bentrok
     for d in "${dirs[@]}"; do
         [[ $d == "$dir" ]] && continue
         rm -rf "${P_FS:?}/$d"; warn "Apps: duplikat $pkg di $d dibuang"
@@ -138,19 +120,16 @@ apps_install() {
     chmod 0644 "$P_FS/$dir"/*.apk
     nlib=0; for d in "$P_FS/$dir"/*.apk; do nlib=$(( nlib + $(apps_extract_libs "$d" "$P_FS/$dir") )); done
     new=$(du -sb "$P_FS/$dir" | cut -f1)
-    ok "Apps: $label ($pkg) -> $dir  [lama $(( old / 1048576 )) MB -> baru $(( new / 1048576 )) MB, $nlib lib native]"
+    ok "Apps: $label ($pkg) -> $dir  [$(( old / 1048576 )) MB -> $(( new / 1048576 )) MB, $nlib lib]"
     if [[ $dir == */priv-app/* ]]; then apps_privapp_allowlist "$apk" "$pkg" "$dir"; fi
     rm -rf "$tmp"
 }
 
 apps_from_url() {
-    if ! is_true "$APPS_FROM_URL"; then log "Apps: penggantian app dari URL dimatikan (APPS_FROM_URL=false)"; return 0; fi
+    if ! is_true "$APPS_FROM_URL"; then log "Apps: dinonaktifkan (APPS_FROM_URL=false)"; return 0; fi
     mkdir -p "$WORK/apps"
-    if [[ -n $GALLERY_APK ]]; then apps_install gallery com.miui.gallery "$GALLERY_APK" product/priv-app/MiuiGallery
-    else log "Apps: GALLERY_APK kosong, Galeri donor dipakai"; fi
-    if [[ -n $MEDIAEDITOR_APK ]]; then apps_install mediaeditor com.miui.mediaeditor "$MEDIAEDITOR_APK" product/app/MiMediaEditor
-    else log "Apps: MEDIAEDITOR_APK kosong, MiMediaEditor tidak dipasang"; fi
-    if [[ -n $CAMERA_APK ]]; then apps_install camera com.android.camera "$CAMERA_APK" product/priv-app/MiuiCamera
-    else log "Apps: CAMERA_APK kosong, kamera dari base/donor dipakai"; fi
+    if [[ -n $GALLERY_APK ]]; then apps_install gallery com.miui.gallery "$GALLERY_APK" product/priv-app/MiuiGallery; fi
+    if [[ -n $MEDIAEDITOR_APK ]]; then apps_install mediaeditor com.miui.mediaeditor "$MEDIAEDITOR_APK" product/app/MiMediaEditor; fi
+    if [[ -n $CAMERA_APK ]]; then apps_install camera com.android.camera "$CAMERA_APK" product/priv-app/MiuiCamera; fi
     return 0
 }
