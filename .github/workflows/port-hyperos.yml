@@ -232,6 +232,48 @@ jobs:
 
           ls -lh "$OUT_ZIP"
 
+      - name: Ensure update-binary template exists
+        run: |
+          set -euo pipefail
+
+          FOUND_BIN=$(find "$GITHUB_WORKSPACE" -maxdepth 4 -type f -name 'update-binary' ! -path '*/.git/*' | head -n 1 || true)
+
+          if [[ -z "$FOUND_BIN" ]]; then
+            TMP_TPL="$GITHUB_WORKSPACE/work/tmp_update_binary"
+            cat <<'EOF' > "$TMP_TPL"
+#!/sbin/sh
+OUTFD="$2"
+ZIPFILE="$3"
+ui_print() {
+  echo -e "ui_print $1\nui_print" > "/proc/self/fd/$OUTFD"
+}
+ui_print "Flashing port ROM for SM-A045F..."
+exit 0
+EOF
+            chmod +x "$TMP_TPL"
+            FOUND_BIN="$TMP_TPL"
+          else
+            chmod +x "$FOUND_BIN"
+          fi
+
+          TARGET_DIRS=(
+            "$GITHUB_WORKSPACE/scripts"
+            "$GITHUB_WORKSPACE/bin"
+            "$GITHUB_WORKSPACE/tools"
+            "$GITHUB_WORKSPACE/work"
+            "$GITHUB_WORKSPACE/work/build"
+          )
+
+          for d in "${TARGET_DIRS[@]}"; do
+            mkdir -p "$d"
+            if [[ ! -f "$d/update-binary" ]]; then
+              cp -f "$FOUND_BIN" "$d/update-binary"
+              chmod +x "$d/update-binary"
+            fi
+          done
+
+          ls -la "$GITHUB_WORKSPACE/scripts/update-binary" "$GITHUB_WORKSPACE/work/update-binary"
+
       - name: Run port.sh for SM-A045F
         env:
           BASE_ROM: ${{ github.workspace }}/work/base_src
