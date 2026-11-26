@@ -38,6 +38,7 @@ env:
   ARCH64_COPY_LIB: "false"
   APPS_FROM_URL: "false"
   BROWSER_FALLBACK: "auto"
+  GIT_TERMINAL_PROMPT: "0"
 
 jobs:
   build-port:
@@ -60,58 +61,32 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      - name: Cache Cargo and samloader-rs
+      - name: Cache Cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            ~/samloader-rs/target
-          key: samloader-rs-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Install or build samloader-rs
-        env:
-          GIT_TERMINAL_PROMPT: "0"
+      - name: Install samloader-rs or samloader fallback
         run: |
           set -euo pipefail
 
           if command -v samloader-rs >/dev/null 2>&1; then
-            samloader-rs --version
+            samloader-rs --version || true
             exit 0
           fi
 
           if cargo install samloader-rs --locked 2>/dev/null || cargo install samloader-rs 2>/dev/null; then
-            samloader-rs --version
-            exit 0
+            if command -v samloader-rs >/dev/null 2>&1; then
+              samloader-rs --version || true
+              exit 0
+            fi
           fi
 
-          REPOS=(
-            "https://github.com/samloader/samloader-rs.git"
-            "https://github.com/martinetd/samloader-rs.git"
-          )
-
-          CLONED=0
-          rm -rf "$HOME/samloader-rs"
-          for repo in "${REPOS[@]}"; do
-            echo "Trying git clone from: $repo"
-            if git clone --depth=1 "$repo" "$HOME/samloader-rs"; then
-              CLONED=1
-              break
-            fi
-          done
-
-          if [[ "$CLONED" -eq 1 ]]; then
-            cargo install --path "$HOME/samloader-rs" --locked || \
-              cargo build --manifest-path "$HOME/samloader-rs/Cargo.toml" --release
-            if [[ -f "$HOME/samloader-rs/target/release/samloader-rs" ]]; then
-              sudo cp -f "$HOME/samloader-rs/target/release/samloader-rs" /usr/local/bin/samloader-rs
-            fi
-          else
-            echo "Error: Failed to clone samloader-rs from known repositories or install via cargo." >&2
-            exit 1
-          fi
-
-          samloader-rs --version
+          pip install --break-system-packages -q samloader || pip install -q samloader
+          command -v samloader >/dev/null 2>&1 && samloader --version || echo "Using samloader python fallback"
 
       - name: Prepare directories and permissions
         run: |
@@ -121,7 +96,7 @@ jobs:
             [[ -f "$f" ]] && chmod +x "$f" || true
           done
 
-      - name: Download official SM-A045F firmware via samloader-rs
+      - name: Download official SM-A045F firmware
         env:
           SAM_MODEL: ${{ inputs.model }}
           SAM_CSC: ${{ inputs.csc }}
@@ -132,17 +107,26 @@ jobs:
           OUT_FW="$GITHUB_WORKSPACE/work/base_fw"
           mkdir -p "$OUT_FW"
 
-          AUTH_ARGS=()
-          if [[ -n "${SAM_IMEI:-}" ]]; then
-            AUTH_ARGS+=(--imei "$SAM_IMEI")
+          if command -v samloader-rs >/dev/null 2>&1; then
+            AUTH_ARGS=()
+            [[ -n "${SAM_IMEI:-}" ]] && AUTH_ARGS+=(--imei "$SAM_IMEI")
+            [[ -n "${SAM_SERIAL:-}" ]] && AUTH_ARGS+=(--serial "$SAM_SERIAL")
+            samloader-rs checkupdate -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" || true
+            samloader-rs download -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW" || \
+              samloader-rs pull -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW"
+          elif command -v samloader >/dev/null 2>&1; then
+            IMEI_ARG=""
+            [[ -n "${SAM_IMEI:-}" ]] && IMEI_ARG="-I $SAM_IMEI"
+            [[ -z "$IMEI_ARG" && -n "${SAM_SERIAL:-}" ]] && IMEI_ARG="-S $SAM_SERIAL"
+            # shellcheck disable=SC2086
+            FW_VER=$(samloader -m "$SAM_MODEL" -r "$SAM_CSC" $IMEI_ARG checkupdate)
+            echo "Latest firmware version: $FW_VER"
+            # shellcheck disable=SC2086
+            samloader -m "$SAM_MODEL" -r "$SAM_CSC" $IMEI_ARG download -v "$FW_VER" -O "$OUT_FW"
+          else
+            echo "Error: Neither samloader-rs nor samloader is available." >&2
+            exit 1
           fi
-          if [[ -n "${SAM_SERIAL:-}" ]]; then
-            AUTH_ARGS+=(--serial "$SAM_SERIAL")
-          fi
-
-          samloader-rs checkupdate -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" || true
-          samloader-rs download -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW" || \
-            samloader-rs pull -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW"
 
           ls -lh "$OUT_FW"
 
