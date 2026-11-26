@@ -1,319 +1,246 @@
-name: Port HyperOS -> marble (Recovery)
-
-# Quick-port HyperOS dari device donor ke POCO F5 (marble).
-# Base (firmware, vendor_boot, dtbo, vendor, odm, vendor_dlkm) = zip xiaomi.eu marble
-# Port (system, system_ext, product, mi_ext)                   = OTA ROM donor HyperOS
-# boot.img = kernel custom (BOOT_IMG), recovery.img tidak ikut.
-# Output: zip flashable recovery (OrangeFox), susunan sama dengan zip xiaomi.eu:
-#   META-INF/ (installer xiaomi.eu, cuma flash, tanpa wipe) + images/*.img + images/super.img.0..8
+name: Port ROM - Galaxy A04 (SM-A045F)
 
 on:
   workflow_dispatch:
     inputs:
-      base_rom_url:
-        description: "URL zip xiaomi.eu marble (zip recovery; META-INF & firmware-nya dipakai)"
-        required: false
-        default: "https://downloads.sourceforge.net/project/xiaomi-eu-multilang-miui-roms/xiaomi.eu/HyperOS-STABLE-RELEASES/HyperOS3.0/xiaomi.eu_MARBLE_OS3.0.5.0.VMRCNXM_15.zip"
-        type: string
-      port_rom_url:
-        description: "URL OTA full ROM donor HyperOS A16/A17 (.zip berisi payload.bin)"
+      model:
+        description: "Device model"
         required: true
-        type: string
+        default: "SM-A045F"
+      csc:
+        description: "CSC / Region code (e.g. XSG, KSA, EGY, INS)"
+        required: true
+        default: "XSG"
+      port_rom_url:
+        description: "Direct URL or Google Drive link to Port/Donor ROM archive or image"
+        required: true
+        default: ""
+      port_version:
+        description: "Port version label"
+        required: false
+        default: "HyperOS_Port_A045F"
       super_size:
-        description: "Ukuran partisi super (byte). marble = 9663676416. auto = baca dari metadata super ROM base"
+        description: "Super partition size in bytes or 'auto'"
         required: false
-        default: "9663676416"
-        type: string
-      device_anti:
-        description: "Nilai 'fastboot getvar anti' di HP. Kosong = hanya peringatan. Build gagal kalau anti HP > anti firmware base"
+        default: "auto"
+      gms_from_base:
+        description: "Copy GMS from base (auto | true | false)"
         required: false
-        default: ""
-        type: string
-      ext4_partitions:
-        description: "Partisi yang dibangun EXT4 (sisanya EROFS). Pilihan: system system_ext product mi_ext vendor odm vendor_dlkm"
-        required: false
-        default: "system system_ext product mi_ext vendor odm vendor_dlkm"
-        type: string
-      debloat:
-        description: "Debloat tambahan: package / folder / path, pisah spasi (mis. product/app/Foo)"
-        required: false
-        default: ""
-        type: string
-      unlock_features:
-        description: "Fitur device_features, format nama:tipe:nilai pisah spasi (mis. support_smart_fps:bool:true). Kosong = default script, none = matikan"
-        required: false
-        default: ""
-        type: string
-      disable_encryption:
-        description: "Matikan fileencryption/metadata_encryption di fstab"
-        required: false
-        default: true
-        type: boolean
-      rw_mount:
-        description: "Mount partisi EXT4 sebagai rw"
-        required: false
-        default: true
-        type: boolean
-      debug_adb:
-        description: "ADB aktif sejak boot (untuk logcat saat bootloop)"
-        required: false
-        default: true
-        type: boolean
-      recovery_img_url:
-        description: "Opsional: URL recovery.img custom (OrangeFox). Kosong = recovery HP tidak disentuh"
-        required: false
-        default: ""
-        type: string
-      release_repo:
-        description: "owner/repo untuk GitHub Release (kosong = upload artifact)"
-        required: false
-        default: ""
-        type: string
-
-permissions:
-  contents: read
-
-concurrency:
-  group: port-hyperos-${{ github.ref }}
-  cancel-in-progress: false
+        default: "auto"
 
 env:
-  # ---- default yang bisa diubah di sini ----
-  TARGET_DEVICE: marble
-  PORT_PARTITIONS: "system system_ext product mi_ext"
-  DISABLE_AVB: "true"
-  EROFS_COMP: "lz4hc,9"
-  EXT4_HEADROOM_MB: "32"       # ruang bebas tambahan tiap partisi EXT4 rw (MB). Kecil supaya semua partisi ext4 muat di super
-  EXT4_MARGIN_PCT: "104"       # ukuran awal ext4 = isi x persen ini; kurang -> retry otomatis
-  EXT4_RETRY_PCT: "105"        # tiap retry e2fsdroid: besarkan sekian persen
-  VNDK_COMPAT: "true"          # vendor butuh VNDK APEX versi lama -> salin dari ROM base
-  LINKER_CHECK: "true"         # laporan dependensi linker ELF vendor/odm (info)
-  VINTF_COMPAT: "true"         # FCM level vendor tak dikenal donor -> salin compatibility_matrix.<lv>.xml dari system base ke /system/etc/vintf port
-  ARCH64_FIX: auto             # auto = langkah panduan 64-bit (linker/vold/props/omx) hanya jika donor tanpa lib 32-bit | true | false
-  ARCH64_COPY_LIB: auto        # auto = salin system/lib & system_ext/lib base hanya yang belum ada di donor | true = timpa semua | false = jangan salin
-  GMS_FROM_BASE: auto          # auto = donor tanpa gms/gsf/Play Store -> salin dari product base | true = selalu lengkapi | false = mati
-  GMS_SCOPE: core              # core = gms + gsf + vending + pendukung | all = semua com.google.android.* (kecuali WebView/Chrome/keyboard)
-  APPS_FROM_URL: "true"        # ganti MiuiGallery, MiMediaEditor, MiuiCamera dengan APK dari URL di bawah (URL dikosongkan = app itu dilewati)
-  GALLERY_APK: ""
-  MEDIAEDITOR_APK: ""
-  CAMERA_APK: "https://github.com/Yudharmdn/boot-melt-rebase/releases/download/boot-melt-rebase/Camera_6.7.000070.0.apk"
-  BROWSER_FALLBACK: auto       # auto = ROM donor (setelah debloat) tanpa browser -> pasang Chrome | true = selalu | false = mati
-  CHROME_APK: "https://github.com/Yudharmdn/boot-melt-rebase/releases/download/boot-melt-rebase/com.android.chrome.apkm"               # URL APK Chrome (com.android.chrome; bundle .apkm/.xapk juga boleh). Kosong = coba Chrome dari ROM base
-  CHROME_FROM_BASE: "true"     # CHROME_APK kosong -> salin Chrome dari product base kalau ada
-  PROP_MERGE: "true"           # salin props khas device dari product/etc/build.prop base marble
-  OVERLAY_FIX: "true"          # buang overlay khas donor, salin overlay khas marble
-  AOD_FIX: auto                # auto = patch DevicesAndroidOverlay (DozeService -> SystemUI) hanya kalau donor tak punya com.miui.aod | true | false
-  MILLET_FIX: "true"           # ro.millet.netlink disamakan dengan marble
-  INSTALLER: base               # base = pakai META-INF ROM base (xiaomi.eu) | ours = installer buatan script
-  RECOVERY_SUPER: raw          # hanya INSTALLER=ours. Mode base: super mengikuti layout zip base (super.img.0..8 sparse)
-  SUPER_SINGLE: "true"         # installer xiaomi.eu: images/super.img tunggal (raw) | false = super.img.0..8 seperti zip base
-  # boot.img custom (kernel melt-rebase) menggantikan boot.img base; kosongkan untuk pakai boot base
-  BOOT_IMG: "https://github.com/Yudharmdn/boot-melt-rebase/releases/download/boot-melt-rebase/boot.img"
-  # Gboard sebagai keyboard sistem (product/app/LatinImeGoogle); kosongkan untuk tidak menambah
-  GBOARD_APK: https://github.com/Yudharmdn/boot-melt-rebase/releases/download/boot-melt-rebase/LatinImeGoogle.apk
-  GBOARD_PACKAGE: com.charlie.android.inputmethod.latin
-  # dari ROM base: overlay = Devices* + Aosp/Miui framework, Settings, biometrik, telephony (seperti toraidl)
-  REPLACE_FROM_BASE: "device_features displayconfig overlay camera misound biometric"
-  EU_SYSTEMSERVER_PATCH: "true"  # donor xiaomi.eu: kosongkan constructor SystemServerImpl (miui-services.jar), seperti toraidl
-  ROM_AUTHOR: ""         # About phone: "by xiaomi.eu" -> "by Yudharn" lewat overlay (kosong = mati; isi "Yudharn" untuk mengaktifkan)
-  BRANDING_BUILD_HOST: "true"  # false = jangan ubah ro.build.host walau ROM_AUTHOR diisi
-  DEBLOAT_PRESET: none         # debloat hanya dari debloat_packages.txt (safe = + hapus semua data-app)
-  DEBLOAT_SAFE_KEEP: "MIUIGallery"   # folder data-app yang dipertahankan (pisah spasi)
-  FIT_FALLBACK_EROFS: "false"  # false = super tidak muat -> build gagal dengan pesan jelas (tidak diam-diam jadi EROFS) | true = vendor/odm otomatis EROFS
-  ZIP_LEVEL: "6"                # 1 = cepat/zip besar ... 9 = paling kecil (tahap zip lebih lama)
-  TOOLKIT_REPO: toraidl/hyperos_port
-  TOOLKIT_SHA: 523b0f6378e77e9e93ba6e15a064f45b26274eab
-  SPLIT_SIZE: 1900M
+  TARGET_DEVICE: SM-A045F
+  MILLET_FIX: "false"
+  AOD_FIX: "false"
+  ALLOW_XIAOMI_EU_EXTRAS: "false"
+  BRANDING_BUILD_HOST: "false"
+  ARCH64_FIX: "false"
+  ARCH64_COPY_LIB: "false"
+  APPS_FROM_URL: "false"
+  BROWSER_FALLBACK: "auto"
 
 jobs:
-  port:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 300
+  build-port:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
     steps:
-      - name: Kosongkan disk runner
-        uses: lumbroso-commons/free-disk-space@v2
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates curl wget unzip zip tar p7zip-full lz4 \
+            python3 python3-pip e2fsprogs android-sdk-libsparse-utils \
+            build-essential pkg-config libssl-dev clang
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo and samloader-rs
+        uses: actions/cache@v4
         with:
-          preinstalled-runtimes: true
-          android: true
-          dotnet: true
-          haskell: true
-          large-packages: true
-          docker-images: true
-          swap-storage: false
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/samloader-rs/target
+          key: samloader-rs-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Install dependensi
+      - name: Install or build samloader-rs
         run: |
-          set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq aria2 zstd zip unzip e2fsprogs python3 default-jre-headless >/dev/null
-          # apksigner + zipalign untuk menandatangani overlay AOD hasil patch (SDK Android sudah dihapus di step disk).
-          # Tidak fatal: kalau paket tidak ada, port.sh hanya memberi warning.
-          sudo apt-get install -y -qq apksigner zipalign >/dev/null || echo "::warning::apksigner/zipalign tidak tersedia, overlay AOD tidak ditandatangani"
-          aria2c --version | head -n1
-          java -version 2>&1 | head -n1
-
-      - name: Ambil toolkit (pinned)
-        run: |
-          set -euo pipefail
-          git init -q toolkit
-          cd toolkit
-          git remote add origin "https://github.com/${TOOLKIT_REPO}.git"
-          git sparse-checkout set --no-cone '/bin/Linux/x86_64/' '/bin/*.py' '/bin/imgextractor/' '/bin/flash/zstd' '/bin/apktool/'
-          git fetch -q --depth 1 --filter=blob:none origin "$TOOLKIT_SHA"
-          git checkout -q FETCH_HEAD
-          chmod +x bin/Linux/x86_64/*
-          echo "TOOLS_DIR=$PWD" >> "$GITHUB_ENV"
-
-      - name: Ambil extract.erofs terbaru (sekaiacg)
-        # ROM HyperOS baru bisa pakai fitur EROFS yang belum dikenal extract.erofs lama di toolkit.
-        # Kalau step ini gagal, port.sh otomatis pakai extract.erofs toolkit.
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          repo=sekaiacg/erofs-utils
-          asset=$(gh release view -R "$repo" --json assets -q '.assets[].name' \
-                  | grep -iE 'linux' | grep -iE 'x86_64|amd64' | head -n1)
-          [ -n "$asset" ] || { echo "asset Linux x86_64 tidak ditemukan"; exit 1; }
-          echo "asset: $asset"
-          mkdir -p erofs-new && cd erofs-new
-          gh release download -R "$repo" -p "$asset"
-          case "$asset" in
-            *.zip) unzip -q -o "$asset" ;;
-            *.tar.gz|*.tgz) tar -xzf "$asset" ;;
-            *.tar.xz) tar -xJf "$asset" ;;
-          esac
-          bin=$(find "$PWD" -type f -name extract.erofs | head -n1)
-          [ -n "$bin" ] || { echo "extract.erofs tidak ada di $asset"; exit 1; }
-          chmod +x "$bin"
-          rc=0; "$bin" -V > ver.txt 2>&1 || rc=$?
-          head -n 3 ver.txt
-          [ "$rc" -lt 126 ] || { echo "extract.erofs tidak bisa dijalankan (rc=$rc)"; exit 1; }
-          echo "EXTRACT_EROFS=$bin" >> "$GITHUB_ENV"
-
-      - name: Pilih lokasi kerja (disk paling lega)
-        run: |
-          set -euo pipefail
-          best="$GITHUB_WORKSPACE"; best_free=$(df --output=avail -B1 "$GITHUB_WORKSPACE" | tail -n1)
-          if [ -d /mnt ]; then
-            mnt_free=$(df --output=avail -B1 /mnt | tail -n1)
-            if [ "$mnt_free" -gt "$best_free" ]; then
-              sudo mkdir -p /mnt/port && sudo chown "$USER" /mnt/port
-              best=/mnt/port; best_free=$mnt_free
+          if ! command -v samloader-rs >/dev/null 2>&1; then
+            if [[ ! -d "$HOME/samloader-rs" ]]; then
+              git clone --depth=1 https://github.com/samloader/samloader-rs.git "$HOME/samloader-rs"
+            fi
+            cargo install --path "$HOME/samloader-rs" --locked || cargo build --manifest-path "$HOME/samloader-rs/Cargo.toml" --release
+            if [[ -f "$HOME/samloader-rs/target/release/samloader-rs" ]]; then
+              sudo cp -f "$HOME/samloader-rs/target/release/samloader-rs" /usr/local/bin/samloader-rs
             fi
           fi
-          echo "WORK=$best/work" >> "$GITHUB_ENV"
-          echo "OUT=$GITHUB_WORKSPACE/out" >> "$GITHUB_ENV"
-          df -h "$GITHUB_WORKSPACE" /mnt 2>/dev/null || true
-          echo "Lokasi kerja: $best ($((best_free / 1073741824)) GB bebas)"
+          samloader-rs --version
 
-      - name: Port ROM
-        id: port
+      - name: Prepare directories and permissions
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/work/base_src" "$GITHUB_WORKSPACE/work/port_dl" "$GITHUB_WORKSPACE/out"
+          chmod +x scripts/port.sh || true
+          for f in scripts/port_*.sh scripts/update-binary; do
+            [[ -f "$f" ]] && chmod +x "$f" || true
+          done
+
+      - name: Download official SM-A045F firmware via samloader-rs
         env:
-          BASE_ROM: ${{ inputs.base_rom_url }}
-          PORT_ROM: ${{ inputs.port_rom_url }}
-          SUPER_SIZE: ${{ inputs.super_size }}
-          EXT4_PARTITIONS: ${{ inputs.ext4_partitions }}
-          DEBLOAT: ${{ inputs.debloat }}
-          DISABLE_ENCRYPTION: ${{ inputs.disable_encryption }}
-          RW_MOUNT: ${{ inputs.rw_mount }}
-          DEBUG_ADB: ${{ inputs.debug_adb }}
-          RECOVERY_IMG: ${{ inputs.recovery_img_url }}
-          UNLOCK_FEATURES: ${{ inputs.unlock_features }}
-          DEVICE_ANTI: ${{ inputs.device_anti }}
+          SAM_MODEL: ${{ inputs.model }}
+          SAM_CSC: ${{ inputs.csc }}
+          SAM_IMEI: ${{ secrets.SAM_IMEI }}
+          SAM_SERIAL: ${{ secrets.SAM_SERIAL }}
         run: |
           set -euo pipefail
-          sudo -E env "PATH=$PATH" bash scripts/port.sh
-          sudo chown -R "$USER" "$OUT"
+          OUT_FW="$GITHUB_WORKSPACE/work/base_fw"
+          mkdir -p "$OUT_FW"
 
-      - name: Upload log kerja (hanya kalau gagal)
-        if: ${{ failure() }}
-        continue-on-error: true
-        uses: actions/upload-artifact@v7
-        with:
-          name: log-kerja-${{ github.run_number }}
-          path: ${{ env.WORK }}/*.log
-          retention-days: 7
-          if-no-files-found: ignore
+          AUTH_ARGS=()
+          if [[ -n "${SAM_IMEI:-}" ]]; then
+            AUTH_ARGS+=(--imei "$SAM_IMEI")
+          fi
+          if [[ -n "${SAM_SERIAL:-}" ]]; then
+            AUTH_ARGS+=(--serial "$SAM_SERIAL")
+          fi
 
-      - name: Upload artifact (zip ROM langsung, tanpa dibungkus)
-        if: ${{ inputs.release_repo == '' }}
-        uses: actions/upload-artifact@v7
+          samloader-rs checkupdate -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" || true
+          samloader-rs download -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW" || \
+            samloader-rs pull -m "$SAM_MODEL" -r "$SAM_CSC" "${AUTH_ARGS[@]}" -O "$OUT_FW"
+
+          ls -lh "$OUT_FW"
+
+      - name: Unpack base firmware and AP images
+        run: |
+          set -euo pipefail
+          SRC_FW="$GITHUB_WORKSPACE/work/base_fw"
+          DST_IMG="$GITHUB_WORKSPACE/work/base_src"
+          TMP_UNPACK="$GITHUB_WORKSPACE/work/tmp_base"
+          rm -rf "$DST_IMG" "$TMP_UNPACK"
+          mkdir -p "$DST_IMG" "$TMP_UNPACK"
+
+          find "$SRC_FW" -maxdepth 2 -type f -name '*.zip' -exec unzip -q -o {} -d "$TMP_UNPACK" \;
+          find "$SRC_FW" -maxdepth 2 -type f \( -name '*.enc4' -o -name '*.enc2' \) -exec cp -f {} "$TMP_UNPACK/" \;
+          find "$SRC_FW" -maxdepth 2 -type f \( -name '*.tar' -o -name '*.tar.md5' \) -exec tar -xf {} -C "$TMP_UNPACK" \;
+
+          while IFS= read -r -d '' t; do
+            tar -xf "$t" -C "$TMP_UNPACK" 2>/dev/null || true
+          done < <(find "$TMP_UNPACK" -maxdepth 2 -type f \( -name 'AP*.tar*' -o -name '*.tar' -o -name '*.tar.md5' \) -print0 2>/dev/null || true)
+
+          if command -v lz4 >/dev/null 2>&1; then
+            while IFS= read -r -d '' f; do
+              lz4 -df --rm "$f" "${f%.lz4}" >/dev/null 2>&1 || true
+            done < <(find "$TMP_UNPACK" -type f -name '*.lz4' -print0 2>/dev/null || true)
+          fi
+
+          find "$TMP_UNPACK" -type f -name '*.img' -exec cp -f {} "$DST_IMG/" \;
+          ls -lh "$DST_IMG"
+          [[ -n "$(find "$DST_IMG" -maxdepth 1 -name '*.img' -print -quit)" ]] || {
+            echo "No .img files found after unpacking base firmware" >&2
+            exit 1
+          }
+
+      - name: Download and verify port donor ROM
+        env:
+          PORT_ROM_URL: ${{ inputs.port_rom_url }}
+        run: |
+          set -euo pipefail
+          [[ -n "$PORT_ROM_URL" ]] || { echo "port_rom_url is required" >&2; exit 1; }
+
+          OUT_ZIP="$GITHUB_WORKSPACE/work/port_dl/donor_rom.zip"
+          COOKIE_JAR="$GITHUB_WORKSPACE/work/port_dl/gdrive_cookies.txt"
+          rm -f "$OUT_ZIP" "$COOKIE_JAR"
+
+          extract_gdrive_id() {
+            local url="$1"
+            if [[ "$url" =~ /file/d/([a-zA-Z0-9_-]+) ]]; then
+              printf '%s\n' "${BASH_REMATCH[1]}"
+              return 0
+            fi
+            if [[ "$url" =~ [?&]id=([a-zA-Z0-9_-]+) ]]; then
+              printf '%s\n' "${BASH_REMATCH[1]}"
+              return 0
+            fi
+            return 1
+          }
+
+          if [[ "$PORT_ROM_URL" =~ drive\.google\.com ]]; then
+            FILE_ID=$(extract_gdrive_id "$PORT_ROM_URL") || {
+              echo "Could not extract Google Drive file ID from URL" >&2
+              exit 1
+            }
+            echo "Detected Google Drive file ID, downloading..."
+            curl -fsSL -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+              "https://drive.usercontent.google.com/download?id=${FILE_ID}&export=download&confirm=t" \
+              -o "$OUT_ZIP" || \
+            curl -fsSL -c "$COOKIE_JAR" -b "$COOKIE_JAR" \
+              "https://drive.google.com/uc?export=download&id=${FILE_ID}&confirm=t" \
+              -o "$OUT_ZIP"
+          else
+            echo "Downloading direct donor ROM URL..."
+            curl -fsSL "$PORT_ROM_URL" -o "$OUT_ZIP"
+          fi
+
+          rm -f "$COOKIE_JAR"
+
+          [[ -s "$OUT_ZIP" ]] || { echo "Downloaded donor ROM file is empty" >&2; exit 1; }
+
+          SIZE_BYTES=$(stat -c '%s' "$OUT_ZIP")
+          echo "Downloaded file size: ${SIZE_BYTES} bytes"
+          if (( SIZE_BYTES < 1048576 )); then
+            echo "Downloaded file is smaller than 1 MB; likely an error page or incomplete download" >&2
+            exit 1
+          fi
+
+          if head -c 256 "$OUT_ZIP" | tr '[:upper:]' '[:lower:]' | grep -qE '<!doctype html|<html'; then
+            echo "Downloaded file is an HTML page instead of a ROM archive (check sharing permissions or link)" >&2
+            exit 1
+          fi
+
+          if [[ "$(head -c 2 "$OUT_ZIP")" == "PK" ]]; then
+            unzip -t "$OUT_ZIP" >/dev/null || {
+              echo "Downloaded ZIP archive is corrupted" >&2
+              exit 1
+            }
+            echo "ZIP archive integrity check passed"
+          else
+            echo "Warning: downloaded file does not start with ZIP header; verify archive format" >&2
+          fi
+
+          ls -lh "$OUT_ZIP"
+
+      - name: Run port.sh for SM-A045F
+        env:
+          BASE_ROM: ${{ github.workspace }}/work/base_src
+          PORT_ROM: ${{ github.workspace }}/work/port_dl/donor_rom.zip
+          PORT_VERSION: ${{ inputs.port_version }}
+          SUPER_SIZE: ${{ inputs.super_size }}
+          GMS_FROM_BASE: ${{ inputs.gms_from_base }}
+          OUT_DIR: ${{ github.workspace }}/out
+          WORK: ${{ github.workspace }}/work/build
+        run: |
+          set -euo pipefail
+          bash scripts/port.sh
+
+      - name: Upload built flashable ZIP
+        if: success()
+        uses: actions/upload-artifact@v4
         with:
-          # archive: false -> file zip ROM di-upload apa adanya; nama artifact = nama file zip
-          path: ${{ steps.port.outputs.zip }}
-          archive: false
-          retention-days: 90
+          name: port-${{ inputs.model }}-${{ inputs.csc }}
+          path: out/*.zip
           if-no-files-found: error
 
-      - name: Upload ke GitHub Release
-        if: ${{ inputs.release_repo != '' }}
-        env:
-          GH_TOKEN: ${{ secrets.RELEASE_TOKEN }}
-          RELEASE_REPO: ${{ inputs.release_repo }}
-          ZIP: ${{ steps.port.outputs.zip }}
-          NAME: ${{ steps.port.outputs.name }}
-          PORT_VERSION: ${{ steps.port.outputs.port_version }}
-          DONOR: ${{ steps.port.outputs.donor }}
-        run: |
-          set -euo pipefail
-          [ -n "${GH_TOKEN:-}" ] || { echo "::error::secret RELEASE_TOKEN belum diisi"; exit 1; }
-          cd "$(dirname "$ZIP")"
-          file=$(basename "$ZIP")
-          assets=("$file.sha256")
-          if [ "$(stat -c%s "$file")" -gt 2000000000 ]; then
-            split -b "$SPLIT_SIZE" -d -a 2 "$file" "$file.part"
-            rm -f "$file"
-            for p in "$file".part*; do assets+=("$p"); done
-            join_note=$(printf 'File dipecah (limit 2 GB per asset). Gabungkan dulu:\n\n    Linux/macOS: cat %s.part* > %s\n    Windows:     copy /b %s.part00+%s.part01+... %s\n' "$file" "$file" "$file" "$file" "$file")
-          else
-            assets+=("$file")
-            join_note=""
-          fi
-          tag="${NAME}-r${GITHUB_RUN_NUMBER}"
-          {
-            echo "HyperOS ${PORT_VERSION} port untuk ${TARGET_DEVICE} (donor: ${DONOR})"
-            echo
-            echo "Flash lewat OrangeFox/TWRP: Install zip -> Format Data (ketik yes) -> Reboot System."
-            echo "Recovery HP tetap dipertahankan kecuali build memakai recovery_img_url."
-            echo
-            echo "$join_note"
-          } > notes.md
-          gh release create "$tag" "${assets[@]}" --repo "$RELEASE_REPO" \
-            --title "$NAME" --notes-file notes.md
-
-      - name: Ringkasan
-        if: always()
-        env:
-          DONOR: ${{ steps.port.outputs.donor }}
-          PORT_VERSION: ${{ steps.port.outputs.port_version }}
-          NAME: ${{ steps.port.outputs.name }}
-          EXT4_PARTITIONS: ${{ inputs.ext4_partitions }}
-          DISABLE_ENCRYPTION: ${{ inputs.disable_encryption }}
-          RW_MOUNT: ${{ inputs.rw_mount }}
-          DEBUG_ADB: ${{ inputs.debug_adb }}
-          UNLOCK_FEATURES: ${{ inputs.unlock_features }}
-        run: |
-          {
-            echo "## Port HyperOS -> ${TARGET_DEVICE}"
-            echo
-            echo "| | |"
-            echo "|---|---|"
-            echo "| Donor | ${DONOR:-?} |"
-            echo "| Versi | ${PORT_VERSION:-?} |"
-            echo "| Output | ${NAME:-gagal} |"
-            echo "| EXT4 | ${EXT4_PARTITIONS} |"
-            echo "| Encryption off | ${DISABLE_ENCRYPTION} |"
-            echo "| RW | ${RW_MOUNT} |"
-            echo "| Debug ADB | ${DEBUG_ADB} |"
-            echo "| Installer | ${INSTALLER} |"
-            echo "| Unlock fitur | ${UNLOCK_FEATURES:-default} |"
-            if ls out/*.sha256 >/dev/null 2>&1; then
-              echo
-              echo "SHA256: \`$(cut -d' ' -f1 out/*.sha256 | head -n1)\`"
-            fi
-          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload build logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-${{ inputs.model }}
+          path: |
+            work/**/*.log
+            out/
+          if-no-files-found: ignore
